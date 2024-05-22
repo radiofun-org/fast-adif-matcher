@@ -7,6 +7,7 @@ import (
 	"github.com/flwyd/adif-multitool/adif"
 	"github.com/flwyd/adif-multitool/adif/spec"
 	"github.com/skrushinsky/scaliger/julian"
+	"log"
 	"os"
 	"runtime/pprof"
 	"strconv"
@@ -164,7 +165,7 @@ var START_JULIAN = julian.CivilToJulian(julian.CivilDate{Year: 1950, Month: 1, D
 
 func initDatabase(conn *sqlite.Conn) error {
 	err := sqlitex.Execute(conn, `
-		CREATE TABLE contacts (
+		CREATE TABLE IF NOT EXISTS contacts (
 			id integer PRIMARY KEY,
 			date integer,     -- 2 bytes,    julian date difference from 1900-01-01
 			time integer,     -- 1-2 bytes,  minutes since midnight, e.g. 0-1439
@@ -176,10 +177,11 @@ func initDatabase(conn *sqlite.Conn) error {
 			grid_size integer -- 1 byte,     4 or 6
 		)`, &sqlitex.ExecOptions{})
 	if err != nil {
+		return err
 	}
 
 	err = sqlitex.Execute(conn, `
-		CREATE TABLE matches (
+		CREATE TABLE IF NOT EXISTS matches (
 			id integer PRIMARY KEY,
 			date integer,          -- 2 bytes,    julian date difference from 1900-01-01
 			time integer,          -- 1-2 bytes,  minutes since midnight, e.g. 0-1439
@@ -193,17 +195,24 @@ func initDatabase(conn *sqlite.Conn) error {
 			from_grid_size integer -- 1 byte,     4 or 6
 		)`, &sqlitex.ExecOptions{})
 	if err != nil {
+		return err
 	}
 
-	err = sqlitex.Execute(conn, `CREATE INDEX date_to_id_index ON contacts (date, to_id)`, &sqlitex.ExecOptions{})
+	err = sqlitex.Execute(conn, `CREATE INDEX IF NOT EXISTS date_to_id_index ON contacts (date, to_id)`, &sqlitex.ExecOptions{})
 	if err != nil {
+		return err
 	}
 
-	return sqlitex.Execute(conn, `
-		CREATE TABLE callsigns (
+	err = sqlitex.Execute(conn, `
+		CREATE TABLE IF NOT EXISTS callsigns (
 			id integer PRIMARY KEY,
 			callsign text unique
 		)`, &sqlitex.ExecOptions{})
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
 
 func addCallsign(conn *sqlite.Conn, callsign string) (int64, error) {
@@ -357,7 +366,7 @@ func process(filename string, callsign string) {
 
 	err = initDatabase(conn)
 	if err != nil {
-		//fmt.Printf("Error creating table: %s\n", err)
+		log.Panicf("Error initializing database: %v\n", err)
 	}
 
 	io := adif.NewADIIO()
