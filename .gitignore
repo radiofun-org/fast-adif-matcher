@@ -1,4 +1,5 @@
 fast-matcher
 .idea/
 *.prof
-*.sqlite
+*.sqlite*
+.env

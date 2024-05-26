@@ -9,11 +9,14 @@ import (
 	mapset "github.com/deckarep/golang-set/v2"
 	"github.com/flwyd/adif-multitool/adif"
 	"github.com/flwyd/adif-multitool/adif/spec"
+	"github.com/getsentry/sentry-go"
+	_ "github.com/joho/godotenv/autoload"
 	"github.com/skrushinsky/scaliger/julian"
 	"golang.org/x/exp/constraints"
 	"io"
 	"log"
 	"os"
+	"regexp"
 	"runtime/pprof"
 	"strconv"
 	"time"
@@ -35,6 +38,8 @@ import (
 const MaxInt = int(^uint(0) >> 1)
 const MinInt = -MaxInt - 1
 
+var Numeric = regexp.MustCompile(`^\d+`)
+
 func Abs[T constraints.Integer](x T) T {
 	if x < 0 {
 		return -x
@@ -43,109 +48,287 @@ func Abs[T constraints.Integer](x T) T {
 	return x
 }
 
-var MODES = map[string]int{
-	// TODO renumber these
-	"AM":           12,
-	"AMTOR":        101,
-	"AMTORFEC":     13,
-	"ARDOP":        14,
-	"ASCI":         15,
-	"ATV":          16,
-	"C4FM":         17,
-	"CHIP":         18,
-	"CHIP128":      19,
-	"CHIP64":       20,
-	"CLO":          21,
-	"CLOVER":       91, // not an actual ADIF mode
-	"CONTESTI":     22,
-	"CW":           1,
-	"DATA":         92, // not an actual ADIF mode
-	"DIGITALVOICE": 7,
-	"DOMINO":       23,
-	"DOMINOF":      24,
-	"DMR":          100,
-	"DSTAR":        25,
-	"DYNAMIC":      10,
-	"FAX":          26,
-	"FM":           4,
-	"FMHELL":       27,
-	"FSK31":        28,
-	"FSK441":       29,
-	"FST4":         89, // not an actual ADIF mode
-	"FT4":          96, // not an actual ADIF mode
-	"FT8":          0,
+var Modes = map[string]int{
+	"AM":           1,
+	"AMTOR":        2,
+	"AMTORFEC":     3,
+	"ARDOP":        4,
+	"ASCI":         5,
+	"ATV":          6,
+	"C4FM":         7,
+	"CHIP":         8,
+	"CHIP128":      9,
+	"CHIP64":       10,
+	"CLO":          11,
+	"CLOVER":       12, // not an actual ADIF mode
+	"CONTESTI":     13,
+	"CW":           14,
+	"DATA":         15, // not an actual ADIF mode
+	"DIGITALVOICE": 16,
+	"DOMINO":       17,
+	"DOMINOF":      18,
+	"DMR":          19,
+	"DSTAR":        20,
+	"DYNAMIC":      21,
+	"FAX":          22,
+	"FM":           23,
+	"FMHELL":       24,
+	"FSK31":        25,
+	"FSK441":       26,
+	"FST4":         27, // not an actual ADIF mode
+	"FT4":          28, // not an actual ADIF mode
+	"FT8":          29,
 	"GTOR":         30,
 	"HELL":         31,
 	"HELL80":       32,
 	"HFSK":         33,
-	"IMAGE":        97, // not an actual ADIF mode
-	"ISCAT":        34,
-	"JT4":          35,
-	"JT44":         36,
-	"JT4A":         37,
-	"JT4B":         38,
-	"JT4C":         39,
-	"JT4D":         40,
-	"JT4E":         41,
-	"JT4F":         42,
-	"JT4G":         43,
-	"JT65":         44,
-	"JT65A":        45,
-	"JT65B":        46,
-	"JT65C":        47,
-	"JT6M":         48,
-	"JT9":          49,
-	"MFSK":         3,
-	"MFSK16":       50,
-	"MFSK8":        51,
-	"MSK144":       9,
-	"MT63":         52,
-	"OLIVIA":       53,
-	"OPERA":        54,
-	"PAC":          11,
-	"PAC2":         55,
-	"PAC3":         56,
-	"PACKET":       93, // not an actual ADIF mode
-	"PACTOR":       95, // not an actual ADIF mode
-	"PAX":          57,
-	"PAX2":         58,
-	"PCW":          59,
-	"PHONE":        94, // not an actual ADIF mode
-	"PKT":          6,
-	"PSK":          5,
-	"PSK10":        60,
-	"PSK125":       61,
-	"PSK2K":        62,
-	"PSK31":        63,
-	"PSK63":        64,
-	"PSK63F":       65,
-	"PSKAM":        90, // not an actual ADIF mode
-	"PSKAM10":      66,
-	"PSKAM31":      67,
-	"PSKAM50":      68,
-	"PSKFEC31":     69,
-	"PSKHELL":      70,
-	"Q15":          71,
-	"Q65":          98, // not an actual ADIF mode
-	"QPSK125":      72,
-	"QPSK31":       73,
-	"QPSK63":       74,
-	"QRA64":        75,
-	"ROS":          76,
-	"RTTY":         8,
-	"RTTYM":        77,
-	"SSB":          2,
-	"SSTV":         78,
-	"T10":          79,
-	"THOR":         80,
-	"THRB":         81,
-	"THRBX":        82,
-	"THROB":        99, // not an actual ADIF mode
-	"TOR":          83,
-	"V4":           84,
-	"VOI":          85,
-	"WINMOR":       86,
-	"WSPR":         87,
+	"IMAGE":        34, // not an actual ADIF mode
+	"ISCAT":        35,
+	"JT4":          36,
+	"JT44":         37,
+	"JT4A":         38,
+	"JT4B":         39,
+	"JT4C":         40,
+	"JT4D":         41,
+	"JT4E":         42,
+	"JT4F":         43,
+	"JT4G":         44,
+	"JT65":         45,
+	"JT65A":        46,
+	"JT65B":        47,
+	"JT65C":        48,
+	"JT6M":         49,
+	"JT9":          50,
+	"MFSK":         51,
+	"MFSK16":       52,
+	"MFSK8":        53,
+	"MSK144":       54,
+	"MT63":         55,
+	"OLIVIA":       56,
+	"OPERA":        57,
+	"PAC":          58,
+	"PAC2":         59,
+	"PAC3":         60,
+	"PACKET":       61, // not an actual ADIF mode
+	"PACTOR":       62, // not an actual ADIF mode
+	"PAX":          63,
+	"PAX2":         64,
+	"PCW":          65,
+	"PHONE":        66, // not an actual ADIF mode
+	"PKT":          67,
+	"PSK":          68,
+	"PSK10":        69,
+	"PSK125":       70,
+	"PSK2K":        71,
+	"PSK31":        72,
+	"PSK63":        73,
+	"PSK63F":       74,
+	"PSKAM":        75, // not an actual ADIF mode
+	"PSKAM10":      76,
+	"PSKAM31":      77,
+	"PSKAM50":      78,
+	"PSKFEC31":     79,
+	"PSKHELL":      80,
+	"Q15":          81,
+	"Q65":          82, // not an actual ADIF mode
+	"QPSK125":      83,
+	"QPSK31":       84,
+	"QPSK63":       85,
+	"QRA64":        86,
+	"ROS":          87,
+	"RTTY":         88,
+	"RTTYM":        89,
+	"SSB":          90,
+	"SSTV":         91,
+	"T10":          92,
+	"THOR":         93,
+	"THRB":         94,
+	"THRBX":        95,
+	"THROB":        96, // not an actual ADIF mode
+	"TOR":          97,
+	"V4":           98,
+	"VOI":          99,
+	"WINMOR":       100,
+	"WSPR":         101,
+}
+
+var SubModes = map[string]int{
+	"8PSK1000":       1,
+	"8PSK1000F":      2,
+	"8PSK1200F":      3,
+	"8PSK125":        4,
+	"8PSK125F":       5,
+	"8PSK125FL":      6,
+	"8PSK250":        7,
+	"8PSK250F":       8,
+	"8PSK250FL":      9,
+	"8PSK500":        10,
+	"8PSK500F":       11,
+	"AMTORFEC":       12,
+	"ASCI":           13,
+	"C4FM":           14,
+	"CHIP128":        15,
+	"CHIP64":         16,
+	"DMR":            17,
+	"DOM-M":          18,
+	"DOM11":          19,
+	"DOM16":          20,
+	"DOM22":          21,
+	"DOM4":           22,
+	"DOM44":          23,
+	"DOM5":           24,
+	"DOM8":           25,
+	"DOM88":          26,
+	"DOMINOEX":       27,
+	"DOMINOF":        28,
+	"DSTAR":          29,
+	"FMHELL":         30,
+	"FREEDV":         31,
+	"FSK31":          32,
+	"FSKHELL":        33,
+	"FSQCALL":        34,
+	"FST4":           35,
+	"FST4W":          36,
+	"FT4":            37,
+	"GTOR":           38,
+	"HELL80":         39,
+	"HELLX5":         40,
+	"HELLX9":         41,
+	"HFSK":           42,
+	"ISCAT-A":        43,
+	"ISCAT-B":        44,
+	"JS8":            45,
+	"JT4A":           46,
+	"JT4B":           47,
+	"JT4C":           48,
+	"JT4D":           49,
+	"JT4E":           50,
+	"JT4F":           51,
+	"JT4G":           52,
+	"JT65A":          53,
+	"JT65B":          54,
+	"JT65B2":         55,
+	"JT65C":          56,
+	"JT65C2":         57,
+	"JT9-1":          58,
+	"JT9-10":         59,
+	"JT9-2":          60,
+	"JT9-30":         61,
+	"JT9-5":          62,
+	"JT9A":           63,
+	"JT9B":           64,
+	"JT9C":           65,
+	"JT9D":           66,
+	"JT9E":           67,
+	"JT9E FAST":      68,
+	"JT9F":           69,
+	"JT9F FAST":      70,
+	"JT9G":           71,
+	"JT9G FAST":      72,
+	"JT9H":           73,
+	"JT9H FAST":      74,
+	"JTMS":           75,
+	"LSB":            76,
+	"M17":            77,
+	"MFSK11":         78,
+	"MFSK128":        79,
+	"MFSK128L":       80,
+	"MFSK16":         81,
+	"MFSK22":         82,
+	"MFSK31":         83,
+	"MFSK32":         84,
+	"MFSK4":          85,
+	"MFSK64":         86,
+	"MFSK64L":        87,
+	"MFSK8":          88,
+	"NAVTEX":         89,
+	"OLIVIA 16/1000": 90,
+	"OLIVIA 16/500":  91,
+	"OLIVIA 32/1000": 92,
+	"OLIVIA 4/125":   93,
+	"OLIVIA 4/250":   94,
+	"OLIVIA 8/250":   95,
+	"OLIVIA 8/500":   96,
+	"OPERA-BEACON":   97,
+	"OPERA-QSO":      98,
+	"PAC2":           99,
+	"PAC3":           100,
+	"PAC4":           101,
+	"PAX2":           102,
+	"PCW":            103,
+	"PSK10":          104,
+	"PSK1000":        105,
+	"PSK1000RC2":     106,
+	"PSK125":         107,
+	"PSK125RC10":     108,
+	"PSK125RC12":     109,
+	"PSK125RC16":     110,
+	"PSK125RC4":      111,
+	"PSK125RC5":      112,
+	"PSK250":         113,
+	"PSK250RC2":      114,
+	"PSK250RC3":      115,
+	"PSK250RC5":      116,
+	"PSK250RC6":      117,
+	"PSK250RC7":      118,
+	"PSK31":          119,
+	"PSK500":         120,
+	"PSK500RC2":      121,
+	"PSK500RC3":      122,
+	"PSK500RC4":      123,
+	"PSK63":          124,
+	"PSK63F":         125,
+	"PSK63RC10":      126,
+	"PSK63RC20":      127,
+	"PSK63RC32":      128,
+	"PSK63RC4":       129,
+	"PSK63RC5":       130,
+	"PSK800RC2":      131,
+	"PSKAM10":        132,
+	"PSKAM31":        133,
+	"PSKAM50":        134,
+	"PSKFEC31":       135,
+	"PSKHELL":        136,
+	"Q65":            137,
+	"QPSK125":        138,
+	"QPSK250":        139,
+	"QPSK31":         140,
+	"QPSK500":        141,
+	"QPSK63":         142,
+	"QRA64A":         143,
+	"QRA64B":         144,
+	"QRA64C":         145,
+	"QRA64D":         146,
+	"QRA64E":         147,
+	"ROS-EME":        148,
+	"ROS-HF":         149,
+	"ROS-MF":         150,
+	"SIM31":          151,
+	"SITORB":         152,
+	"SLOWHELL":       153,
+	"THOR-M":         154,
+	"THOR100":        155,
+	"THOR11":         156,
+	"THOR16":         157,
+	"THOR22":         158,
+	"THOR25X4":       159,
+	"THOR4":          160,
+	"THOR5":          161,
+	"THOR50X1":       162,
+	"THOR50X2":       163,
+	"THOR8":          164,
+	"THRBX":          165,
+	"THRBX1":         166,
+	"THRBX2":         167,
+	"THRBX4":         168,
+	"THROB1":         169,
+	"THROB2":         170,
+	"THROB4":         171,
+	"USB":            172,
+	"VARA FM 1200":   173,
+	"VARA FM 9600":   174,
+	"VARA HF":        175,
+	"VARA SATELLITE": 176,
 }
 
 var ModeGroups = map[string]string{
@@ -225,7 +408,7 @@ var ModeGroups = map[string]string{
 
 var ModeGroupsById = map[int]string{}
 
-var BANDS = map[string]int{
+var Bands = map[string]int{
 	"2190m":  0,
 	"630m":   1,
 	"560m":   2,
@@ -263,27 +446,37 @@ var BANDS = map[string]int{
 
 var StartJulian = julian.CivilToJulian(julian.CivilDate{Year: 1950, Month: 1, Day: 1})
 
-// TODO state (primary administrative)
-// TODO county (secondary administrative)
-// TODO country
-// TODO CQ zone
-// TODO ITU zone
-// TODO IOTA
+// TODO handle up to 10 character grids, support MY_GRIDSQUARE_EXT
+// TODO IOTA: MY_IOTA (or MY_SIG + MY_SIG_INFO?) (MY_IOTA_ISLAND_ID seems undocumented and unused)
+// TODO POTA: MY_POTA_REF (or MY_SIG + MY_SIG_INFO)
+// TODO SOTA: MY_SOTA_REF (or MY_SIG + MY_SIG_INFO?)
+// TODO WWFF: MY_WWFF_REF (or MY_SIG + MY_SIG_INFO?)
+// TODO handle OPERATOR, STATION_CALLSIGN, OWNER_CALLSIGN?
+// TODO handle BAND_RX/FREQ_RX? in practice is it ever different than BAND?
+// TODO infer anything from MY_LAT/MY_LON?
+// TODO SAT_MODE/SAT_NAME?
+// TODO RST_SENT/RST_RCVD?
+// TODO TIME_OFF
 
 func initDatabase(conn *sqlite.Conn) error {
-	// TODO add metadata table for ADIF metadata
-
 	err := sqlitex.Execute(conn, `
 		CREATE TABLE IF NOT EXISTS contacts (
-			id integer PRIMARY KEY,
-			date integer,      -- 2 bytes,    julian date difference from 1900-01-01
-			time integer,      -- 1-2 bytes,  minutes since midnight, e.g. 0-1439
-			from_id integer,   -- 1-3 bytes,  the ID of the callsign record
-			to_id integer,     -- 1-3 bytes,  the ID of the callsign record
-			band integer,      -- 1 byte,     an enum into the ADIF BANDS list
-			mode integer,      -- 1 byte,     an enum into the ADIF MODES list
-			grid integer,      -- 1-4 bytes,  0 to 18,662,400
-			grid_size integer, -- 1 byte,     4 or 6
+			id INTEGER PRIMARY KEY,
+			date INTEGER,                  -- 2 bytes,    julian date difference from 1900-01-01
+			time INTEGER,                  -- 1-2 bytes,  minutes since midnight, e.g. 0-1439
+			from_id INTEGER,               -- 1-3 bytes,  the ID of the callsign record
+			to_id INTEGER,                 -- 1-3 bytes,  the ID of the callsign record
+			band INTEGER,                  -- 1 byte,     an enum into the ADIF Bands list
+			mode INTEGER,                  -- 1 byte,     an enum into the ADIF Modes list
+			sub_mode INTEGER,              -- 1 byte,     an enum into the ADIF SubModes list
+			grid INTEGER,                  -- 1-4 bytes,  0 to 18,662,400
+			grid_size INTEGER,             -- 1 byte,     4 or 6
+			administrative_primary TEXT,   -- 1-3 bytes,  state from ADIF, convert to enum eventually?
+			administrative_secondary TEXT, -- 1-n bytes,  county from ADIF, convert to enum eventually?
+			dxcc TEXT,                     -- 1-3 bytes,  country from ADIF, convert to enum eventually?
+			zone_cq INTEGER,               -- 1 byte,     CQ zone
+			zone_itu INTEGER,              -- 1 byte,     ITU zone
+			tx_power INTEGER,              -- 1 byte,     the transmit power in watts
 			UNIQUE(date, time, from_id, to_id)
 		)`, &sqlitex.ExecOptions{})
 	if err != nil {
@@ -304,27 +497,14 @@ func initDatabase(conn *sqlite.Conn) error {
 		return err
 	}
 
-	// TODO Should match table only contain the ID pairings/times/call IDs? Then we can update the individual files with those...
 	err = sqlitex.Execute(conn, `
 		CREATE TABLE IF NOT EXISTS matches (
 			id integer PRIMARY KEY,
-			created integer,         -- 4 bytes     UNIX epoch time
-			a_id integer,            -- 1-4 bytes   ID of the record in the contacts table
-			b_id integer,            -- 1-4 bytes   ID of the record in the contacts table
-			a_date integer,          -- 2 bytes,    julian date difference from 1950-01-01
-			a_time integer,          -- 1-2 bytes,  minutes since midnight, e.g. 0-1439
-			b_date integer,          -- 2 bytes,    julian date difference from 1950-01-01
-			b_time integer,          -- 1-2 bytes,  minutes since midnight, e.g. 0-1439
-			a_call_id integer,       -- 1-3 bytes,  the ID of the callsign record
-			b_call_id integer,       -- 1-3 bytes,  the ID of the callsign record
-			a_band integer,          -- 1 byte,     an enum into the ADIF BANDS list
-			a_mode integer,          -- 1 byte,     an enum into the ADIF MODES list
-			b_band integer,          -- 1 byte,     an enum into the ADIF BANDS list
-			b_mode integer,          -- 1 byte,     an enum into the ADIF MODES list
-			a_grid integer,          -- 1-4 bytes,  0 to 18,662,400
-			a_grid_size integer,     -- 1 byte,     4 or 6
-			b_grid integer,          -- 1-4 bytes,  0 to 18,662,400
-			b_grid_size integer,     -- 1 byte,     4 or 6
+			matched_at INTEGER,      -- 4 bytes     UNIX epoch time
+			a_id INTEGER,            -- 1-4 bytes   ID of the record in the contacts table
+			b_id INTEGER,            -- 1-4 bytes   ID of the record in the contacts table
+			a_call_id INTEGER,       -- 1-3 bytes,  the ID of the callsign record
+			b_call_id INTEGER,       -- 1-3 bytes,  the ID of the callsign record
 			UNIQUE (a_id, b_id) ON CONFLICT IGNORE
 		)`, &sqlitex.ExecOptions{})
 	if err != nil {
@@ -361,16 +541,50 @@ func addCallsign(conn *sqlite.Conn, callsign string) (int64, error) {
 	return id, err
 }
 
+type WWFF struct {
+	Program int
+	Number  int
+}
+
+type POTA struct {
+	Country   int
+	Reference int
+}
+
+type IOTA struct {
+	Continent  int
+	Designator int
+}
+
+type SOTA struct {
+	ITU         int
+	Subdivision int
+	Reference   int
+}
+
 type Contact struct {
-	ID       int64
-	Date     int
-	Time     int
-	FromID   int64
-	ToID     int64
-	Band     int
-	Mode     int
-	Grid     int
-	GridSize int
+	ID                      int64
+	Date                    int
+	Time                    int
+	FromID                  int64
+	ToID                    int64
+	Band                    int
+	Mode                    int
+	SubMode                 int
+	Grid                    int
+	GridSize                int
+	ZoneCQ                  int
+	ZoneITU                 int
+	DXCC                    string
+	AdministrativePrimary   string
+	AdministrativeSecondary string
+	SignalReportReceived    int
+	SignalReportSent        int
+	TransmitPower           int
+	POTA                    POTA
+	IOTA                    IOTA
+	SOTA                    SOTA
+	WWFF                    WWFF
 }
 
 func findPotentialMatches(conn *sqlite.Conn, fromId int64, dateStart int, dateEnd int) ([]Contact, error) {
@@ -504,6 +718,154 @@ func withinThirtyMinutes(a Contact, b Contact) bool {
 	return Abs(a.Time-b.Time) <= 30
 }
 
+func recordToContact(fromId int64, record *adif.Record, callsInDatabase map[string]int64) (Contact, error) {
+	contact := Contact{
+		FromID: fromId,
+	}
+
+	var err error
+
+	call, ok := record.Get(spec.CallField.Name)
+	if ok {
+		contact.ToID, ok = callsInDatabase[call.Value]
+		if !ok || contact.ToID == 0 {
+			return contact, fmt.Errorf("can't find call '%s'\n", call.Value)
+		}
+	} else {
+		return contact, fmt.Errorf("can't find CALL in record %s\n", record)
+	}
+
+	band, ok := record.Get(spec.BandField.Name)
+	if ok {
+		contact.Band, ok = Bands[band.Value]
+	} else {
+		ok = inferBand(record, spec.BandField.Name)
+		if ok {
+			band, ok = record.Get(spec.BandField.Name)
+			if ok {
+				contact.Band, ok = Bands[band.Value]
+			}
+		}
+	}
+
+	date, ok := record.Get(spec.QsoDateField.Name)
+	if ok {
+		contact.Date, err = dateStringToJulianDifference(date.Value)
+		if err != nil {
+			return contact, fmt.Errorf("Error parsing date value: %v\n", err)
+		}
+	}
+
+	grid, ok := record.Get(spec.MyGridsquareField.Name)
+	if ok && grid.Value != "" {
+		contact.Grid = maidenheadToNumber(grid.Value)
+		contact.GridSize = len(grid.Value)
+		if contact.GridSize == 8 {
+			contact.GridSize = 6
+		}
+	}
+
+	mode, ok := record.Get(spec.ModeField.Name)
+	if ok {
+		contact.Mode, ok = Modes[mode.Value]
+		if !ok {
+			return contact, fmt.Errorf("missing mode: %s\n", mode.Value)
+		}
+	}
+
+	subMode, ok := record.Get(spec.SubmodeField.Name)
+	if ok {
+		contact.SubMode, ok = SubModes[subMode.Value]
+		if !ok {
+			return contact, fmt.Errorf("missing submode: %s\n", subMode.Value)
+		}
+	}
+
+	//mySig, ok := record.Get(spec.MySigField.Name)
+	//if ok {
+	//	mySigInfo, ok := record.Get(spec.MySigInfoField.Name)
+	//	if ok {
+	//		fmt.Printf("%s: %s\n", mySig.Value, mySigInfo.Value)
+	//	}
+	//}
+
+	timeOn, ok := record.Get(spec.TimeOnField.Name)
+	if ok {
+		contact.Time, err = timeStringToMinutesFromMidnight(timeOn.Value)
+		if err != nil {
+			return contact, fmt.Errorf("error parsing timeOn value: %v\n", err)
+		}
+	}
+
+	zoneCq, ok := record.Get(spec.MyCqZoneField.Name)
+	if ok && zoneCq.Value != "" {
+		contact.ZoneCQ, err = strconv.Atoi(zoneCq.Value)
+		if err != nil {
+			return contact, fmt.Errorf("error parsing zoneCq value: %v\n", err)
+		}
+	}
+
+	zoneItu, ok := record.Get(spec.MyItuZoneField.Name)
+	if ok && zoneItu.Value != "" {
+		contact.ZoneITU, err = strconv.Atoi(zoneItu.Value)
+		if err != nil {
+			return contact, fmt.Errorf("error parsing zoneItu value: %v\n", err)
+		}
+	}
+
+	administrativePrimary, ok := record.Get(spec.MyStateField.Name)
+	if ok && administrativePrimary.Value != "" {
+		contact.AdministrativePrimary = administrativePrimary.Value
+	}
+
+	administrativeSecondary, ok := record.Get(spec.MyCntyField.Name)
+	if ok && administrativeSecondary.Value != "" && administrativeSecondary.Value != "USA" {
+		if contact.AdministrativePrimary != "" {
+			replacer, err := regexp.Compile(fmt.Sprintf(`^%s,\s*`, contact.AdministrativePrimary))
+			if err != nil {
+				return contact, fmt.Errorf("error parsing regular expression: %v\n", err)
+			}
+			contact.AdministrativeSecondary = replacer.ReplaceAllString(administrativeSecondary.Value, "")
+		} else {
+			contact.AdministrativeSecondary = administrativeSecondary.Value
+		}
+
+		if len(contact.AdministrativePrimary) == 2 &&
+			len(contact.AdministrativeSecondary) >= 3 &&
+			contact.AdministrativeSecondary[2] == ',' &&
+			contact.AdministrativeSecondary[0:2] != contact.AdministrativePrimary {
+			// e.g. if primary is "PA" and secondary is "NC,Crow Hill" then let's zero them both out
+			contact.AdministrativePrimary = ""
+			contact.AdministrativeSecondary = ""
+		}
+	}
+
+	transmitPower, ok := record.Get(spec.TxPwrField.Name)
+	if ok && transmitPower.Value != "" {
+		match := Numeric.FindString(transmitPower.Value)
+		if match != "" {
+			contact.TransmitPower, err = strconv.Atoi(match)
+			if err != nil {
+				return contact, fmt.Errorf("error parsing transmitPower value: %v\n", err)
+			}
+		}
+	}
+
+	dxcc, ok := record.Get(spec.DxccField.Name)
+	if ok && dxcc.Value != "" {
+		contact.DXCC = dxcc.Value
+	}
+
+	//SignalReportReceived    int
+	//SignalReportSent        int
+	//POTA                    POTA
+	//IOTA                    IOTA
+	//SOTA                    SOTA
+	//WWFF                    WWFF
+
+	return contact, err
+}
+
 func process(filename string, callsign string) {
 	start := time.Now()
 
@@ -545,9 +907,9 @@ func process(filename string, callsign string) {
 		log.Panic(err)
 	}
 
-	adifVersion, _ := logfile.Header.Get("ADIF_VER")
-	programId, _ := logfile.Header.Get("PROGRAMID")
-	programVersion, _ := logfile.Header.Get("PROGRAMVERSION")
+	adifVersion, _ := logfile.Header.Get(spec.AdifVerField.Name)
+	programId, _ := logfile.Header.Get(spec.ProgramidField.Name)
+	programVersion, _ := logfile.Header.Get(spec.ProgramversionField.Name)
 
 	err = sqlitex.Execute(
 		conn, `INSERT INTO
@@ -566,7 +928,7 @@ func process(filename string, callsign string) {
 
 	// Collect the unique calls from all the contacts in the file
 	for _, record := range logfile.Records {
-		call, ok := record.Get("CALL")
+		call, ok := record.Get(spec.CallField.Name)
 		if ok {
 			calls.Add(call.Value)
 		}
@@ -636,16 +998,38 @@ func process(filename string, callsign string) {
 	for i := range contacts {
 		err := sqlitex.Execute(
 			conn, `INSERT INTO
-				contacts (date, time, from_id, to_id, band, mode, grid, grid_size)
-				VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+				contacts (date, time, from_id, to_id, band, mode, sub_mode, grid, grid_size, administrative_primary, administrative_secondary, dxcc, zone_cq, zone_itu, tx_power)
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 				ON CONFLICT(date, time, from_id, to_id)
 				DO UPDATE SET
 					band=excluded.band,
 					mode=excluded.mode,
 					grid=excluded.grid,
-					grid_size=excluded.grid_size
+					grid_size=excluded.grid_size,
+					administrative_primary=excluded.administrative_primary,
+					administrative_secondary=excluded.administrative_secondary,
+					dxcc=excluded.dxcc,
+					zone_cq=excluded.zone_cq,
+					zone_itu=excluded.zone_itu,
+					tx_power=excluded.tx_power
 				RETURNING id`,
-			&sqlitex.ExecOptions{Args: []any{contacts[i].Date, contacts[i].Time, contacts[i].FromID, contacts[i].ToID, contacts[i].Band, contacts[i].Mode, contacts[i].Grid, contacts[i].GridSize}, ResultFunc: func(stmt *sqlite.Stmt) error {
+			&sqlitex.ExecOptions{Args: []any{
+				contacts[i].Date,
+				contacts[i].Time,
+				contacts[i].FromID,
+				contacts[i].ToID,
+				contacts[i].Band,
+				contacts[i].Mode,
+				contacts[i].SubMode,
+				contacts[i].Grid,
+				contacts[i].GridSize,
+				contacts[i].AdministrativePrimary,
+				contacts[i].AdministrativeSecondary,
+				contacts[i].DXCC,
+				contacts[i].ZoneCQ,
+				contacts[i].ZoneITU,
+				contacts[i].TransmitPower,
+			}, ResultFunc: func(stmt *sqlite.Stmt) error {
 				contacts[i].ID = stmt.ColumnInt64(0)
 				return nil
 			}})
@@ -700,9 +1084,9 @@ func process(filename string, callsign string) {
 
 			err := sqlitex.Execute(
 				conn, `INSERT INTO
-					matches (created, a_id, b_id, a_date, a_time, b_date, b_time, a_call_id, b_call_id, a_band, a_mode, b_band, b_mode, a_grid, a_grid_size, b_grid, b_grid_size)
-					VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-				&sqlitex.ExecOptions{Args: []any{time.Now().Unix(), dbRecord.ID, fileRecord.ID, dbRecord.Date, dbRecord.Time, fileRecord.Date, fileRecord.Time, dbRecord.FromID, fileRecord.FromID, dbRecord.Band, dbRecord.Mode, fileRecord.Band, fileRecord.Mode, dbRecord.Grid, dbRecord.GridSize, fileRecord.Grid, fileRecord.GridSize}})
+					matches (matched_at, a_id, b_id, a_call_id, b_call_id)
+					VALUES (?, ?, ?, ?, ?)`,
+				&sqlitex.ExecOptions{Args: []any{time.Now().Unix(), dbRecord.ID, fileRecord.ID, dbRecord.FromID, fileRecord.FromID}})
 			if err != nil {
 				log.Panic(err)
 			}
@@ -719,72 +1103,6 @@ func process(filename string, callsign string) {
 	fmt.Printf("%-16s Processed %d contacts in %dms at %fms/contact, found %d matches, %fms/found contact\n", filename, len(logfile.Records), duration.Milliseconds(), float32(duration.Milliseconds())/float32(len(logfile.Records)), matchesFound, float32(duration.Milliseconds())/float32(matchesFound))
 }
 
-func recordToContact(fromId int64, record *adif.Record, callsInDatabase map[string]int64) (Contact, error) {
-	contact := Contact{
-		FromID: fromId,
-	}
-
-	var err error
-
-	call, ok := record.Get("CALL")
-	if ok {
-		contact.ToID, ok = callsInDatabase[call.Value]
-		if !ok || contact.ToID == 0 {
-			return contact, fmt.Errorf("can't find call '%s'\n", call.Value)
-		}
-	} else {
-		return contact, fmt.Errorf("can't find CALL in record %s\n", record)
-	}
-
-	band, ok := record.Get("BAND")
-	if ok {
-		contact.Band, ok = BANDS[band.Value]
-	} else {
-		ok = inferBand(record, "BAND")
-		if ok {
-			band, ok = record.Get("BAND")
-			if ok {
-				contact.Band, ok = BANDS[band.Value]
-			}
-		}
-	}
-
-	date, ok := record.Get("QSO_DATE")
-	if ok {
-		contact.Date, err = dateStringToJulianDifference(date.Value)
-		if err != nil {
-			return contact, fmt.Errorf("Error parsing date value: %v\n", err)
-		}
-	}
-
-	grid, ok := record.Get("MY_GRIDSQUARE")
-	if ok && grid.Value != "" {
-		contact.Grid = maidenheadToNumber(grid.Value)
-		contact.GridSize = len(grid.Value)
-		if contact.GridSize == 8 {
-			contact.GridSize = 6
-		}
-	}
-
-	mode, ok := record.Get("MODE")
-	if ok {
-		contact.Mode, ok = MODES[mode.Value]
-		if !ok {
-			return contact, fmt.Errorf("missing mode: %s\n", mode.Value)
-		}
-	}
-
-	timeOn, ok := record.Get("TIME_ON")
-	if ok {
-		contact.Time, err = timeStringToMinutesFromMidnight(timeOn.Value)
-		if err != nil {
-			return contact, fmt.Errorf("error parsing timeOn value: %v\n", err)
-		}
-	}
-
-	return contact, err
-}
-
 var filename = flag.String("filename", "", "the filename to import")
 var callsign = flag.String("callsign", "", "the callsign for the file in question")
 
@@ -793,6 +1111,20 @@ var profileCpu = flag.String("profile-cpu", "", "write cpu profile to `file`")
 // TODO create resident version that accepts uploads and enqueues them for service by goroutines
 
 func main() {
+	sentryDsn := os.Getenv("SENTRY_DSN")
+
+	if sentryDsn != "" {
+		err := sentry.Init(sentry.ClientOptions{
+			Dsn:              sentryDsn,
+			TracesSampleRate: 0.0,
+			Debug:            false,
+		})
+		if err != nil {
+			log.Fatalf("sentry.Init: %s", err)
+		}
+		defer sentry.Flush(2 * time.Second)
+	}
+
 	flag.Parse()
 
 	if filename == nil || *filename == "" || callsign == nil || *callsign == "" {
@@ -801,7 +1133,7 @@ func main() {
 	}
 
 	for k, v := range ModeGroups {
-		modeId, ok := MODES[k]
+		modeId, ok := Modes[k]
 		if !ok {
 			fmt.Printf("Can't find mode '%s'\n", k)
 			continue
