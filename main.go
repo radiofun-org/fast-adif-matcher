@@ -462,8 +462,10 @@ func initDatabase(conn *sqlite.Conn) error {
 	err := sqlitex.Execute(conn, `
 		CREATE TABLE IF NOT EXISTS contacts (
 			id INTEGER PRIMARY KEY,
+			adif_metadata_id INTEGER,      -- 1-4 bytes,  ID of the adif_metadata record
 			date INTEGER,                  -- 2 bytes,    julian date difference from 1900-01-01
 			time INTEGER,                  -- 1-2 bytes,  minutes since midnight, e.g. 0-1439
+			time_off INTEGER,              -- 1-2 bytes,  minutes since midnight, e.g. 0-1439
 			from_id INTEGER,               -- 1-3 bytes,  the ID of the callsign record
 			to_id INTEGER,                 -- 1-3 bytes,  the ID of the callsign record
 			band INTEGER,                  -- 1 byte,     an enum into the ADIF Bands list
@@ -566,6 +568,7 @@ type Contact struct {
 	ID                      int64
 	Date                    int
 	Time                    int
+	TimeOff                 int
 	FromID                  int64
 	ToID                    int64
 	Band                    int
@@ -591,7 +594,7 @@ func findPotentialMatches(conn *sqlite.Conn, fromId int64, dateStart int, dateEn
 	var contacts []Contact
 
 	err := sqlitex.Execute(conn,
-		`SELECT id, date, time, from_id, to_id, band, mode, grid, grid_size
+		`SELECT id, date, time, time_off, from_id, to_id, band, mode, grid, grid_size
 			   FROM contacts
 			   WHERE
                   to_id = ? AND
@@ -603,12 +606,13 @@ func findPotentialMatches(conn *sqlite.Conn, fromId int64, dateStart int, dateEn
 			contact.ID = stmt.ColumnInt64(0)
 			contact.Date = stmt.ColumnInt(1)
 			contact.Time = stmt.ColumnInt(2)
-			contact.FromID = stmt.ColumnInt64(3)
-			contact.ToID = stmt.ColumnInt64(4)
-			contact.Band = stmt.ColumnInt(5)
-			contact.Mode = stmt.ColumnInt(6)
-			contact.Grid = stmt.ColumnInt(7)
-			contact.GridSize = stmt.ColumnInt(8)
+			contact.TimeOff = stmt.ColumnInt(3)
+			contact.FromID = stmt.ColumnInt64(4)
+			contact.ToID = stmt.ColumnInt64(5)
+			contact.Band = stmt.ColumnInt(6)
+			contact.Mode = stmt.ColumnInt(7)
+			contact.Grid = stmt.ColumnInt(8)
+			contact.GridSize = stmt.ColumnInt(9)
 
 			contacts = append(contacts, contact)
 
@@ -700,6 +704,7 @@ func inferBand(r *adif.Record, name string) bool {
 	return false
 }
 
+// TODO handle TimeOff
 func withinThirtyMinutes(a Contact, b Contact) bool {
 	// must be within one day to be within 30 minutes
 	if Abs(a.Date-b.Date) > 1 {
@@ -911,11 +916,17 @@ func process(filename string, callsign string) {
 	programId, _ := logfile.Header.Get(spec.ProgramidField.Name)
 	programVersion, _ := logfile.Header.Get(spec.ProgramversionField.Name)
 
+	var adifMetadataId int64
+
 	err = sqlitex.Execute(
 		conn, `INSERT INTO
 					adif_metadata (process_time, file_hash, adif_version, program_id, program_version)
-					VALUES (?, ?, ?, ?, ?)`,
-		&sqlitex.ExecOptions{Args: []any{time.Now().Unix(), hex.EncodeToString(hasher.Sum(nil)), adifVersion.Value, programId.Value, programVersion.Value}})
+					VALUES (?, ?, ?, ?, ?)
+					RETURNING id`,
+		&sqlitex.ExecOptions{Args: []any{time.Now().Unix(), hex.EncodeToString(hasher.Sum(nil)), adifVersion.Value, programId.Value, programVersion.Value}, ResultFunc: func(stmt *sqlite.Stmt) error {
+			adifMetadataId = stmt.ColumnInt64(0)
+			return nil
+		}})
 	if err != nil {
 		log.Panic(err)
 	}
@@ -998,10 +1009,12 @@ func process(filename string, callsign string) {
 	for i := range contacts {
 		err := sqlitex.Execute(
 			conn, `INSERT INTO
-				contacts (date, time, from_id, to_id, band, mode, sub_mode, grid, grid_size, administrative_primary, administrative_secondary, dxcc, zone_cq, zone_itu, tx_power)
-				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+				contacts (adif_metadata_id, date, time, time_off, from_id, to_id, band, mode, sub_mode, grid, grid_size, administrative_primary, administrative_secondary, dxcc, zone_cq, zone_itu, tx_power)
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 				ON CONFLICT(date, time, from_id, to_id)
 				DO UPDATE SET
+					adif_metadata_id=excluded.adif_metadata_id,
+					time_off=excluded.time_off,
 					band=excluded.band,
 					mode=excluded.mode,
 					grid=excluded.grid,
@@ -1014,8 +1027,10 @@ func process(filename string, callsign string) {
 					tx_power=excluded.tx_power
 				RETURNING id`,
 			&sqlitex.ExecOptions{Args: []any{
+				adifMetadataId,
 				contacts[i].Date,
 				contacts[i].Time,
+				contacts[i].TimeOff,
 				contacts[i].FromID,
 				contacts[i].ToID,
 				contacts[i].Band,
