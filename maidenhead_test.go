@@ -80,7 +80,13 @@ func TestNumberToMaidenhead(t *testing.T) {
 		t.Run(tt.want, func(t *testing.T) {
 			got := numberToMaidenhead(tt.number, tt.length)
 			if got != tt.want {
-				t.Errorf("numberToMaidenhead(%d, %d) = %q, want %q", tt.number, tt.length, got, tt.want)
+				t.Errorf(
+					"numberToMaidenhead(%d, %d) = %q, want %q",
+					tt.number,
+					tt.length,
+					got,
+					tt.want,
+				)
 			}
 		})
 	}
@@ -121,7 +127,13 @@ func TestMaidenheadCaseInsensitive(t *testing.T) {
 			na := maidenheadToNumber(tt.a)
 			nb := maidenheadToNumber(tt.b)
 			if na != nb {
-				t.Errorf("maidenheadToNumber(%q) = %d, maidenheadToNumber(%q) = %d, want equal", tt.a, na, tt.b, nb)
+				t.Errorf(
+					"maidenheadToNumber(%q) = %d, maidenheadToNumber(%q) = %d, want equal",
+					tt.a,
+					na,
+					tt.b,
+					nb,
+				)
 			}
 		})
 	}

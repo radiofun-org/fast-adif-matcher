@@ -100,7 +100,12 @@ func TestSpecTestFile(t *testing.T) {
 
 		contacts = append(contacts, contact)
 	}
-	t.Logf("converted %d/%d contacts, %d with errors", len(contacts), len(logfile.Records), len(logfile.Records)-len(contacts))
+	t.Logf(
+		"converted %d/%d contacts, %d with errors",
+		len(contacts),
+		len(logfile.Records),
+		len(logfile.Records)-len(contacts),
+	)
 	for msg, count := range errorCounts {
 		t.Logf("  %4d  %s", count, msg)
 	}
@@ -141,5 +146,9 @@ func TestSpecTestFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("findPotentialMatches: %v", err)
 	}
-	t.Logf("inserted %d contacts, found %d potential matches for reverse lookup", count, len(potentialMatches))
+	t.Logf(
+		"inserted %d contacts, found %d potential matches for reverse lookup",
+		count,
+		len(potentialMatches),
+	)
 }

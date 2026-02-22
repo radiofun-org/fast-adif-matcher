@@ -243,7 +243,13 @@ func TestBulkInsertMatches(t *testing.T) {
 	bulkInsertContacts(db, contacts, metaId)
 
 	matches := []matchRecord{
-		{MatchedAt: 9999, AID: contacts[0].ID, BID: contacts[1].ID, ACallID: call1, BCallID: call2},
+		{
+			MatchedAt: 9999,
+			AID:       contacts[0].ID,
+			BID:       contacts[1].ID,
+			ACallID:   call1,
+			BCallID:   call2,
+		},
 	}
 
 	err := bulkInsertMatches(db, matches)

@@ -1,0 +1,13 @@
+repos:
+  - repo: https://github.com/golangci/golines
+    rev: v0.15.0
+    hooks:
+      - id: golines
+        args: [--max-len=99]
+
+  - repo: https://github.com/dnephin/pre-commit-golang
+    rev: v0.5.1
+    hooks:
+      - id: go-fmt
+      - id: go-vet
+      - id: go-build
