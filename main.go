@@ -1,9 +1,9 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"runtime/debug"
 	"runtime/pprof"
+	"strconv"
 	"strings"
 	"time"
 
@@ -19,28 +20,11 @@ import (
 	"github.com/flwyd/adif-multitool/adif"
 	"github.com/flwyd/adif-multitool/adif/spec"
 	"github.com/getsentry/sentry-go"
+	"github.com/jackc/pgx/v5/pgxpool"
 	_ "github.com/joho/godotenv/autoload"
+	"github.com/redis/go-redis/v9"
 	"golang.org/x/exp/constraints"
 )
-
-// Theory of operation:
-//
-// 1. Read ADIF file
-// 2. Insert the valid records into the contacts table
-// 3. Calculate time extents of the ADIF file, e.g. dates/times of the first and last record
-// 4. Query the sqlite database where toId=the callsign ID of the file and time range between min/max extent
-// 5. Find matches and insert those matches into the matches table
-
-// TODO IOTA: MY_IOTA (or MY_SIG + MY_SIG_INFO?) (MY_IOTA_ISLAND_ID seems undocumented and unused)
-// TODO POTA: MY_POTA_REF (or MY_SIG + MY_SIG_INFO)
-// TODO SOTA: MY_SOTA_REF (or MY_SIG + MY_SIG_INFO?)
-// TODO WWFF: MY_WWFF_REF (or MY_SIG + MY_SIG_INFO?)
-// TODO handle OPERATOR, STATION_CALLSIGN, OWNER_CALLSIGN?
-// TODO handle BAND_RX/FREQ_RX? in practice is it ever different than BAND?
-// TODO infer anything from MY_LAT/MY_LON?
-// TODO SAT_MODE/SAT_NAME?
-// TODO RST_SENT/RST_RCVD?
-// TODO TIME_OFF
 
 const MaxInt = int(^uint(0) >> 1)
 const MinInt = -MaxInt - 1
@@ -49,43 +33,25 @@ func Abs[T constraints.Integer](x T) T {
 	if x < 0 {
 		return -x
 	}
-
 	return x
 }
 
-// TODO handle TimeOff
 func withinThirtyMinutes(a Contact, b Contact) bool {
-	// must be within one day to be within 30 minutes
 	if Abs(a.Date-b.Date) > 1 {
 		return false
 	}
-
 	if a.Date < b.Date {
 		return (1440-a.Time)+b.Time <= 30
 	}
-
 	if a.Date > b.Date {
 		return (1440-b.Time)+a.Time <= 30
 	}
-
-	// same day
 	return Abs(a.Time-b.Time) <= 30
 }
 
-func process(filename string, callsign string) {
+func process(ctx context.Context, pool *pgxpool.Pool, filename string, callsign string) {
 	debug.SetGCPercent(-1)
 	start := time.Now()
-
-	db, err := openDatabase("./contacts.sqlite")
-	if err != nil {
-		log.Panic(err)
-	}
-	defer db.Close()
-
-	err = initDatabase(db)
-	if err != nil {
-		log.Panicf("Error initializing database: %v\n", err)
-	}
 
 	var adifIo adif.Reader
 	if strings.EqualFold(filepath.Ext(filename), ".adx") {
@@ -99,7 +65,6 @@ func process(filename string, callsign string) {
 		log.Panic(err)
 	}
 
-	// Hash the file in a single pass while the ADIF parser reads it
 	hasher := sha256.New()
 	reader := io.TeeReader(f, hasher)
 
@@ -113,7 +78,7 @@ func process(filename string, callsign string) {
 	programVersion, _ := logfile.Header.Get(spec.ProgramversionField.Name)
 
 	adifMetadataId, err := insertAdifMetadata(
-		db,
+		ctx, pool,
 		time.Now().Unix(),
 		hex.EncodeToString(hasher.Sum(nil)),
 		adifVersion.Value,
@@ -125,11 +90,8 @@ func process(filename string, callsign string) {
 	}
 
 	calls := mapset.NewSet[string]()
-
-	// Add the file's callsign first
 	calls.Add(callsign)
 
-	// Collect the unique calls from all the contacts in the file
 	for _, record := range logfile.Records {
 		call, ok := record.Get(spec.CallField.Name)
 		if ok {
@@ -139,17 +101,12 @@ func process(filename string, callsign string) {
 
 	callsInFile := calls.ToSlice()
 
-	callsInFileJson, err := json.Marshal(callsInFile)
-	if err != nil {
-		log.Panicf("Could not marshal calls JSON: %v\n", err)
-	}
-
-	callsInDatabase, err := queryCallsignsByJSON(db, callsInFileJson)
+	callsInDatabase, err := queryCallsigns(ctx, pool, callsInFile)
 	if err != nil {
 		log.Panic(err)
 	}
 
-	callsInDatabase, err = bulkInsertCallsigns(db, callsInFile, callsInDatabase)
+	callsInDatabase, err = bulkInsertCallsigns(ctx, pool, callsInFile, callsInDatabase)
 	if err != nil {
 		log.Panic(err)
 	}
@@ -178,17 +135,16 @@ func process(filename string, callsign string) {
 		contacts = append(contacts, contact)
 	}
 
-	err = bulkInsertContacts(db, contacts, adifMetadataId)
+	err = bulkInsertContacts(ctx, pool, contacts, adifMetadataId)
 	if err != nil {
 		log.Panic(err)
 	}
 
-	potentialMatches, err := findPotentialMatches(db, fromId, dateStart-1, dateEnd+1)
+	potentialMatches, err := findPotentialMatches(ctx, pool, fromId, dateStart-1, dateEnd+1)
 	if err != nil {
 		log.Panic(err)
 	}
 
-	// Index file contacts by ToID for O(1) lookup during matching
 	contactsByToID := map[int64][]Contact{}
 	for _, c := range contacts {
 		contactsByToID[c.ToID] = append(contactsByToID[c.ToID], c)
@@ -240,7 +196,7 @@ func process(filename string, callsign string) {
 		}
 	}
 
-	err = bulkInsertMatches(db, matches)
+	err = bulkInsertMatches(ctx, pool, matches)
 	if err != nil {
 		log.Panic(err)
 	}
@@ -248,26 +204,83 @@ func process(filename string, callsign string) {
 	duration := time.Since(start)
 
 	fmt.Printf(
-		"%-16s Processed %d contacts in %dms at %fms/contact, found %d matches, %fms/found contact\n",
-		filename,
+		"%-16s Processed %d contacts in %dms at %fms/contact, found %d matches\n",
+		filepath.Base(filename),
 		len(logfile.Records),
 		duration.Milliseconds(),
-		float32(duration.Milliseconds())/float32(len(logfile.Records)),
+		float32(duration.Milliseconds())/float32(max(len(logfile.Records), 1)),
 		len(matches),
-		float32(duration.Milliseconds())/float32(len(matches)),
 	)
 }
 
-var filename = flag.String("filename", "", "the filename to import")
-var callsign = flag.String("callsign", "", "the callsign for the file in question")
+func processUpload(ctx context.Context, pool *pgxpool.Pool, uploadID int64, uploadDir string) {
+	var logFile, callsign string
+	err := pool.QueryRow(ctx,
+		`SELECT log_file, callsign FROM app_logupload WHERE id = $1`,
+		uploadID,
+	).Scan(&logFile, &callsign)
+	if err != nil {
+		log.Printf("Error fetching upload %d: %v", uploadID, err)
+		return
+	}
 
+	fullPath := filepath.Join(uploadDir, logFile)
+	log.Printf("Processing upload %d: %s for %s", uploadID, fullPath, callsign)
+
+	process(ctx, pool, fullPath, callsign)
+
+	_, err = pool.Exec(ctx,
+		`UPDATE app_logupload SET processed = true WHERE id = $1`,
+		uploadID,
+	)
+	if err != nil {
+		log.Printf("Error marking upload %d as processed: %v", uploadID, err)
+	}
+}
+
+func consumerLoop(ctx context.Context, pool *pgxpool.Pool, rdb *redis.Client, uploadDir string) {
+	log.Println("Starting Redis consumer loop on log_upload_queue")
+	for {
+		result, err := rdb.BRPop(ctx, 5*time.Second, "log_upload_queue").Result()
+		if err == redis.Nil {
+			continue
+		}
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			log.Printf("Redis BRPOP error: %v", err)
+			time.Sleep(1 * time.Second)
+			continue
+		}
+
+		uploadID, err := strconv.ParseInt(result[1], 10, 64)
+		if err != nil {
+			log.Printf("Invalid upload ID %q: %v", result[1], err)
+			continue
+		}
+
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("Panic processing upload %d: %v", uploadID, r)
+					sentry.CurrentHub().Recover(r)
+					sentry.Flush(2 * time.Second)
+				}
+			}()
+			processUpload(ctx, pool, uploadID, uploadDir)
+		}()
+	}
+}
+
+var flagFilename = flag.String("filename", "", "the filename to import (dev mode)")
+var flagCallsign = flag.String("callsign", "", "the callsign for the file (dev mode)")
 var profileCpu = flag.String("profile-cpu", "", "write cpu profile to `file`")
 
-// TODO create resident version that accepts uploads and enqueues them for service by goroutines
-
 func main() {
-	sentryDsn := os.Getenv("SENTRY_DSN")
+	ctx := context.Background()
 
+	sentryDsn := os.Getenv("SENTRY_DSN")
 	if sentryDsn != "" {
 		err := sentry.Init(sentry.ClientOptions{
 			Dsn:              sentryDsn,
@@ -281,11 +294,6 @@ func main() {
 	}
 
 	flag.Parse()
-
-	if filename == nil || *filename == "" || callsign == nil || *callsign == "" {
-		flag.Usage()
-		os.Exit(1)
-	}
 
 	for k, v := range ModeGroups {
 		modeId, ok := Modes[k]
@@ -302,7 +310,6 @@ func main() {
 			log.Panic(err)
 		}
 		defer func(f *os.File) { _ = f.Close() }(f)
-
 		err = pprof.StartCPUProfile(f)
 		if err != nil {
 			log.Panic(err)
@@ -310,5 +317,45 @@ func main() {
 		defer pprof.StopCPUProfile()
 	}
 
-	process(*filename, *callsign)
+	databaseURL := os.Getenv("DATABASE_URL")
+	if databaseURL == "" {
+		log.Fatal("DATABASE_URL is required")
+	}
+
+	pool, err := openPool(ctx, databaseURL)
+	if err != nil {
+		log.Fatalf("Failed to connect to database: %v", err)
+	}
+	defer pool.Close()
+
+	err = initDatabase(ctx, pool)
+	if err != nil {
+		log.Fatalf("Error initializing database: %v", err)
+	}
+
+	// Dev mode: process a single file and exit
+	if *flagFilename != "" && *flagCallsign != "" {
+		process(ctx, pool, *flagFilename, *flagCallsign)
+		return
+	}
+
+	// Production mode: Redis consumer
+	redisURL := os.Getenv("REDIS_URL")
+	if redisURL == "" {
+		log.Fatal("REDIS_URL is required (or use -filename and -callsign for dev mode)")
+	}
+
+	opts, err := redis.ParseURL(redisURL)
+	if err != nil {
+		log.Fatalf("Invalid REDIS_URL: %v", err)
+	}
+	rdb := redis.NewClient(opts)
+	defer rdb.Close()
+
+	uploadDir := os.Getenv("UPLOAD_DIR")
+	if uploadDir == "" {
+		uploadDir = "."
+	}
+
+	consumerLoop(ctx, pool, rdb, uploadDir)
 }

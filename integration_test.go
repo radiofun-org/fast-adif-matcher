@@ -1,8 +1,7 @@
 package main
 
 import (
-	"database/sql"
-	"encoding/json"
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,16 +10,27 @@ import (
 	mapset "github.com/deckarep/golang-set/v2"
 	"github.com/flwyd/adif-multitool/adif"
 	"github.com/flwyd/adif-multitool/adif/spec"
-	_ "github.com/mattn/go-sqlite3"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 const testADIFile = "adif-spec/316/tests/ADIF_316_test_QSOs_2025_09_15.adi"
 const testADXFile = "adif-spec/316/tests/ADIF_316_test_QSOs_2025_09_15.adx"
 
-// parseAndInsert reads a log file using the given reader, converts records to
-// contacts, and inserts them into an in-memory database. It returns the parsed
-// contact count so callers can compare across formats.
 func parseAndInsert(t *testing.T, filename string, reader adif.Reader) int {
+	t.Helper()
+
+	ctx, pool := setupTestDB(t)
+
+	return parseAndInsertWithDB(t, ctx, pool, filename, reader)
+}
+
+func parseAndInsertWithDB(
+	t *testing.T,
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	filename string,
+	reader adif.Reader,
+) int {
 	t.Helper()
 
 	f, err := os.Open(filename)
@@ -38,16 +48,6 @@ func parseAndInsert(t *testing.T, filename string, reader adif.Reader) int {
 	}
 	t.Logf("parsed %d records from %s", len(logfile.Records), filepath.Base(filename))
 
-	db, err := sql.Open("sqlite3", ":memory:")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	db.SetMaxOpenConns(1)
-	if err := initDatabase(db); err != nil {
-		t.Fatalf("initDatabase: %v", err)
-	}
-
 	const fromCall = "N0TEST"
 	calls := mapset.NewSet[string]()
 	calls.Add(fromCall)
@@ -59,12 +59,11 @@ func parseAndInsert(t *testing.T, filename string, reader adif.Reader) int {
 	callsInFile := calls.ToSlice()
 	t.Logf("unique callsigns: %d", len(callsInFile))
 
-	callsJSON, _ := json.Marshal(callsInFile)
-	callsInDB, err := queryCallsignsByJSON(db, callsJSON)
+	callsInDB, err := queryCallsigns(ctx, pool, callsInFile)
 	if err != nil {
-		t.Fatalf("queryCallsignsByJSON: %v", err)
+		t.Fatalf("queryCallsigns: %v", err)
 	}
-	callsInDB, err = bulkInsertCallsigns(db, callsInFile, callsInDB)
+	callsInDB, err = bulkInsertCallsigns(ctx, pool, callsInFile, callsInDB)
 	if err != nil {
 		t.Fatalf("bulkInsertCallsigns: %v", err)
 	}
@@ -111,18 +110,18 @@ func parseAndInsert(t *testing.T, filename string, reader adif.Reader) int {
 		t.Fatal("converted 0 contacts")
 	}
 
-	metaId, err := insertAdifMetadata(db, 1000, "test-hash", "3.1.6", "test", "1.0")
+	metaId, err := insertAdifMetadata(ctx, pool, 1000, "test-hash", "3.1.6", "test", "1.0")
 	if err != nil {
 		t.Fatalf("insertAdifMetadata: %v", err)
 	}
 
-	err = bulkInsertContacts(db, contacts, metaId)
+	err = bulkInsertContacts(ctx, pool, contacts, metaId)
 	if err != nil {
 		t.Fatalf("bulkInsertContacts: %v", err)
 	}
 
 	var count int
-	db.QueryRow("SELECT count(*) FROM contacts").Scan(&count)
+	pool.QueryRow(ctx, "SELECT count(*) FROM contacts").Scan(&count)
 	if count != len(contacts) {
 		t.Errorf("expected %d rows in contacts, got %d", len(contacts), count)
 	}
@@ -134,7 +133,7 @@ func parseAndInsert(t *testing.T, filename string, reader adif.Reader) int {
 		}
 	}
 
-	potentialMatches, err := findPotentialMatches(db, fromId, dateStart-1, dateEnd+1)
+	potentialMatches, err := findPotentialMatches(ctx, pool, fromId, dateStart-1, dateEnd+1)
 	if err != nil {
 		t.Fatalf("findPotentialMatches: %v", err)
 	}
