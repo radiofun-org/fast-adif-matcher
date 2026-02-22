@@ -9,8 +9,10 @@ import (
 	"io"
 	"log"
 	"os"
+	"path/filepath"
 	"runtime/debug"
 	"runtime/pprof"
+	"strings"
 	"time"
 
 	mapset "github.com/deckarep/golang-set/v2"
@@ -85,7 +87,12 @@ func process(filename string, callsign string) {
 		log.Panicf("Error initializing database: %v\n", err)
 	}
 
-	adifIo := adif.NewADIIO()
+	var adifIo adif.Reader
+	if strings.EqualFold(filepath.Ext(filename), ".adx") {
+		adifIo = adif.NewADXIO()
+	} else {
+		adifIo = adif.NewADIIO()
+	}
 
 	f, err := os.Open(filename)
 	if err != nil {

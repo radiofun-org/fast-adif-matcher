@@ -4,6 +4,8 @@ import (
 	"database/sql"
 	"encoding/json"
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	mapset "github.com/deckarep/golang-set/v2"
@@ -13,29 +15,29 @@ import (
 )
 
 const testADIFile = "adif-spec/316/tests/ADIF_316_test_QSOs_2025_09_15.adi"
+const testADXFile = "adif-spec/316/tests/ADIF_316_test_QSOs_2025_09_15.adx"
 
-func TestSpecTestFile(t *testing.T) {
-	if _, err := os.Stat(testADIFile); os.IsNotExist(err) {
-		t.Skipf("test file not found: %s", testADIFile)
-	}
+// parseAndInsert reads a log file using the given reader, converts records to
+// contacts, and inserts them into an in-memory database. It returns the parsed
+// contact count so callers can compare across formats.
+func parseAndInsert(t *testing.T, filename string, reader adif.Reader) int {
+	t.Helper()
 
-	// parse
-	f, err := os.Open(testADIFile)
+	f, err := os.Open(filename)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer f.Close()
 
-	logfile, err := adif.NewADIIO().Read(f)
+	logfile, err := reader.Read(f)
 	if err != nil {
-		t.Fatalf("ADIF parse error: %v", err)
+		t.Fatalf("parse error: %v", err)
 	}
 	if len(logfile.Records) == 0 {
 		t.Fatal("parsed 0 records")
 	}
-	t.Logf("parsed %d records", len(logfile.Records))
+	t.Logf("parsed %d records from %s", len(logfile.Records), filepath.Base(filename))
 
-	// set up in-memory db
 	db, err := sql.Open("sqlite3", ":memory:")
 	if err != nil {
 		t.Fatal(err)
@@ -46,7 +48,6 @@ func TestSpecTestFile(t *testing.T) {
 		t.Fatalf("initDatabase: %v", err)
 	}
 
-	// collect unique callsigns from CALL fields + a synthetic "from" callsign
 	const fromCall = "N0TEST"
 	calls := mapset.NewSet[string]()
 	calls.Add(fromCall)
@@ -58,7 +59,6 @@ func TestSpecTestFile(t *testing.T) {
 	callsInFile := calls.ToSlice()
 	t.Logf("unique callsigns: %d", len(callsInFile))
 
-	// insert callsigns
 	callsJSON, _ := json.Marshal(callsInFile)
 	callsInDB, err := queryCallsignsByJSON(db, callsJSON)
 	if err != nil {
@@ -74,7 +74,6 @@ func TestSpecTestFile(t *testing.T) {
 		t.Fatal("fromId is 0")
 	}
 
-	// convert records to contacts
 	var contacts []Contact
 	var dateStart = MaxInt
 	var dateEnd = MinInt
@@ -90,14 +89,12 @@ func TestSpecTestFile(t *testing.T) {
 			errorCounts[msg]++
 			continue
 		}
-
 		if contact.Date < dateStart {
 			dateStart = contact.Date
 		}
 		if contact.Date > dateEnd {
 			dateEnd = contact.Date
 		}
-
 		contacts = append(contacts, contact)
 	}
 	t.Logf(
@@ -114,8 +111,7 @@ func TestSpecTestFile(t *testing.T) {
 		t.Fatal("converted 0 contacts")
 	}
 
-	// bulk insert
-	metaId, err := insertAdifMetadata(db, 1000, "test-spec-hash", "3.1.6", "test", "1.0")
+	metaId, err := insertAdifMetadata(db, 1000, "test-hash", "3.1.6", "test", "1.0")
 	if err != nil {
 		t.Fatalf("insertAdifMetadata: %v", err)
 	}
@@ -125,14 +121,12 @@ func TestSpecTestFile(t *testing.T) {
 		t.Fatalf("bulkInsertContacts: %v", err)
 	}
 
-	// verify rows in db match
 	var count int
 	db.QueryRow("SELECT count(*) FROM contacts").Scan(&count)
 	if count != len(contacts) {
 		t.Errorf("expected %d rows in contacts, got %d", len(contacts), count)
 	}
 
-	// verify all contacts got IDs
 	for i, c := range contacts {
 		if c.ID <= 0 {
 			t.Errorf("contacts[%d].ID = %d, expected > 0", i, c.ID)
@@ -140,8 +134,6 @@ func TestSpecTestFile(t *testing.T) {
 		}
 	}
 
-	// run match query (all contacts are from N0TEST so no matches expected,
-	// but this exercises findPotentialMatches against a populated db)
 	potentialMatches, err := findPotentialMatches(db, fromId, dateStart-1, dateEnd+1)
 	if err != nil {
 		t.Fatalf("findPotentialMatches: %v", err)
@@ -151,4 +143,69 @@ func TestSpecTestFile(t *testing.T) {
 		count,
 		len(potentialMatches),
 	)
+
+	return len(contacts)
+}
+
+func TestSpecTestFileADI(t *testing.T) {
+	if _, err := os.Stat(testADIFile); os.IsNotExist(err) {
+		t.Skipf("test file not found: %s", testADIFile)
+	}
+	parseAndInsert(t, testADIFile, adif.NewADIIO())
+}
+
+func TestSpecTestFileADX(t *testing.T) {
+	if _, err := os.Stat(testADXFile); os.IsNotExist(err) {
+		t.Skipf("test file not found: %s", testADXFile)
+	}
+	parseAndInsert(t, testADXFile, adif.NewADXIO())
+}
+
+func TestADIAndADXProduceSameContacts(t *testing.T) {
+	if _, err := os.Stat(testADIFile); os.IsNotExist(err) {
+		t.Skipf("test file not found: %s", testADIFile)
+	}
+	if _, err := os.Stat(testADXFile); os.IsNotExist(err) {
+		t.Skipf("test file not found: %s", testADXFile)
+	}
+
+	adiCount := parseAndInsert(t, testADIFile, adif.NewADIIO())
+	adxCount := parseAndInsert(t, testADXFile, adif.NewADXIO())
+
+	if adiCount != adxCount {
+		t.Errorf("ADI produced %d contacts but ADX produced %d", adiCount, adxCount)
+	}
+	t.Logf("both formats produced %d contacts", adiCount)
+}
+
+func TestReaderForExtension(t *testing.T) {
+	tests := []struct {
+		filename string
+		wantType string
+	}{
+		{"log.adi", "adi"},
+		{"log.adif", "adi"},
+		{"LOG.ADI", "adi"},
+		{"log.ADIF", "adi"},
+		{"log.adx", "adx"},
+		{"LOG.ADX", "adx"},
+		{"path/to/file.adx", "adx"},
+		{"path/to/file.adi", "adi"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.filename, func(t *testing.T) {
+			var reader adif.Reader
+			if strings.EqualFold(filepath.Ext(tt.filename), ".adx") {
+				reader = adif.NewADXIO()
+			} else {
+				reader = adif.NewADIIO()
+			}
+
+			got := reader.(interface{ String() string }).String()
+			if got != tt.wantType {
+				t.Errorf("for %q: got reader type %q, want %q", tt.filename, got, tt.wantType)
+			}
+		})
+	}
 }
