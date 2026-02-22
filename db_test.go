@@ -2,6 +2,9 @@ package main
 
 import (
 	"context"
+	"fmt"
+	"log"
+	"os"
 	"testing"
 	"time"
 
@@ -11,8 +14,9 @@ import (
 	"github.com/testcontainers/testcontainers-go/wait"
 )
 
-func setupTestDB(t *testing.T) (context.Context, *pgxpool.Pool) {
-	t.Helper()
+var testPool *pgxpool.Pool
+
+func TestMain(m *testing.M) {
 	ctx := context.Background()
 
 	pgContainer, err := postgres.Run(ctx, "postgres:18-alpine",
@@ -26,26 +30,46 @@ func setupTestDB(t *testing.T) (context.Context, *pgxpool.Pool) {
 		),
 	)
 	if err != nil {
-		t.Fatalf("failed to start postgres container: %v", err)
+		log.Fatalf("failed to start postgres container: %v", err)
 	}
-	t.Cleanup(func() { pgContainer.Terminate(ctx) })
 
 	connStr, err := pgContainer.ConnectionString(ctx, "sslmode=disable")
 	if err != nil {
-		t.Fatalf("failed to get connection string: %v", err)
+		pgContainer.Terminate(ctx)
+		log.Fatalf("failed to get connection string: %v", err)
 	}
 
-	pool, err := openPool(ctx, connStr)
+	testPool, err = openPool(ctx, connStr)
 	if err != nil {
-		t.Fatalf("failed to open pool: %v", err)
-	}
-	t.Cleanup(func() { pool.Close() })
-
-	if err := initDatabase(ctx, pool); err != nil {
-		t.Fatalf("initDatabase: %v", err)
+		pgContainer.Terminate(ctx)
+		log.Fatalf("failed to open pool: %v", err)
 	}
 
-	return ctx, pool
+	if err := initDatabase(ctx, testPool); err != nil {
+		testPool.Close()
+		pgContainer.Terminate(ctx)
+		log.Fatalf("initDatabase: %v", err)
+	}
+
+	code := m.Run()
+
+	testPool.Close()
+	pgContainer.Terminate(ctx)
+	os.Exit(code)
+}
+
+func setupTestDB(t *testing.T) (context.Context, *pgxpool.Pool) {
+	t.Helper()
+	ctx := context.Background()
+
+	// Truncate all tables to give each test a clean slate
+	for _, table := range []string{"matches", "contacts", "adif_metadata", "callsigns"} {
+		if _, err := testPool.Exec(ctx, fmt.Sprintf("TRUNCATE %s CASCADE", table)); err != nil {
+			t.Fatalf("truncate %s: %v", table, err)
+		}
+	}
+
+	return ctx, testPool
 }
 
 func TestInitDatabase(t *testing.T) {

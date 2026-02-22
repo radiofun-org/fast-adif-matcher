@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"os"
 	"path/filepath"
 	"runtime/debug"
@@ -23,13 +24,9 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	_ "github.com/joho/godotenv/autoload"
 	"github.com/redis/go-redis/v9"
-	"golang.org/x/exp/constraints"
 )
 
-const MaxInt = int(^uint(0) >> 1)
-const MinInt = -MaxInt - 1
-
-func Abs[T constraints.Integer](x T) T {
+func abs(x int) int {
 	if x < 0 {
 		return -x
 	}
@@ -37,7 +34,7 @@ func Abs[T constraints.Integer](x T) T {
 }
 
 func withinThirtyMinutes(a Contact, b Contact) bool {
-	if Abs(a.Date-b.Date) > 1 {
+	if abs(a.Date-b.Date) > 1 {
 		return false
 	}
 	if a.Date < b.Date {
@@ -46,7 +43,7 @@ func withinThirtyMinutes(a Contact, b Contact) bool {
 	if a.Date > b.Date {
 		return (1440-b.Time)+a.Time <= 30
 	}
-	return Abs(a.Time-b.Time) <= 30
+	return abs(a.Time-b.Time) <= 30
 }
 
 func process(ctx context.Context, pool *pgxpool.Pool, filename string, callsign string) {
@@ -113,8 +110,8 @@ func process(ctx context.Context, pool *pgxpool.Pool, filename string, callsign 
 
 	fromId := callsInDatabase[callsign]
 
-	var dateStart = MaxInt
-	var dateEnd = MinInt
+	var dateStart = math.MaxInt
+	var dateEnd = math.MinInt
 
 	var contacts []Contact
 

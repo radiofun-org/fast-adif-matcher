@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -74,8 +75,8 @@ func parseAndInsertWithDB(
 	}
 
 	var contacts []Contact
-	var dateStart = MaxInt
-	var dateEnd = MinInt
+	var dateStart = math.MaxInt
+	var dateEnd = math.MinInt
 	errorCounts := map[string]int{}
 
 	for _, record := range logfile.Records {
