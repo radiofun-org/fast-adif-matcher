@@ -192,6 +192,189 @@ func TestBulkInsertContacts(t *testing.T) {
 	}
 }
 
+func TestBulkInsertContactsSigCoalesce(t *testing.T) {
+	db := setupTestDB(t)
+
+	metaId, _ := insertAdifMetadata(db, 1000, "hash1", "3.1.4", "test", "1.0")
+	fromId, _ := addCallsign(db, "W1AW")
+	toId, _ := addCallsign(db, "K3LR")
+
+	// Upload 1: POTA activation
+	contacts1 := []Contact{
+		{
+			Date: 27000, Time: 600, FromID: fromId, ToID: toId,
+			Band: 8, Mode: 29,
+			MyPOTA: "K-0059",
+			MySig:  "POTA", MySigInfo: "K-0059",
+		},
+	}
+	err := bulkInsertContacts(db, contacts1, metaId)
+	if err != nil {
+		t.Fatalf("insert upload 1: %v", err)
+	}
+	id := contacts1[0].ID
+
+	// Verify POTA and sig fields are stored
+	var pota, iota_, sig, sigInfo sql.NullString
+	err = db.QueryRow("SELECT my_pota, my_iota, my_sig, my_sig_info FROM contacts WHERE id = ?", id).
+		Scan(&pota, &iota_, &sig, &sigInfo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !pota.Valid || pota.String != "K-0059" {
+		t.Fatalf("expected my_pota=K-0059, got %v", pota)
+	}
+	if iota_.Valid {
+		t.Fatalf("expected my_iota=NULL, got %v", iota_)
+	}
+	if !sig.Valid || sig.String != "POTA" {
+		t.Fatalf("expected my_sig=POTA, got %v", sig)
+	}
+	if !sigInfo.Valid || sigInfo.String != "K-0059" {
+		t.Fatalf("expected my_sig_info=K-0059, got %v", sigInfo)
+	}
+
+	// Upload 2: same QSO but now with IOTA (no POTA this time)
+	contacts2 := []Contact{
+		{
+			Date: 27000, Time: 600, FromID: fromId, ToID: toId,
+			Band: 8, Mode: 29,
+			MyIOTA: "NA-148",
+			MySig:  "IOTA", MySigInfo: "NA-148",
+		},
+	}
+	err = bulkInsertContacts(db, contacts2, metaId)
+	if err != nil {
+		t.Fatalf("insert upload 2: %v", err)
+	}
+
+	// Should be same row (upsert)
+	if contacts2[0].ID != id {
+		t.Fatalf("expected same id %d, got %d", id, contacts2[0].ID)
+	}
+
+	// Both POTA and IOTA should be present; sig fields updated to IOTA
+	err = db.QueryRow("SELECT my_pota, my_iota, my_sig, my_sig_info FROM contacts WHERE id = ?", id).
+		Scan(&pota, &iota_, &sig, &sigInfo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !pota.Valid || pota.String != "K-0059" {
+		t.Fatalf("POTA should survive second upload, got %v", pota)
+	}
+	if !iota_.Valid || iota_.String != "NA-148" {
+		t.Fatalf("IOTA should be filled by second upload, got %v", iota_)
+	}
+	if !sig.Valid || sig.String != "IOTA" {
+		t.Fatalf("my_sig should be updated to IOTA, got %v", sig)
+	}
+	if !sigInfo.Valid || sigInfo.String != "NA-148" {
+		t.Fatalf("my_sig_info should be updated to NA-148, got %v", sigInfo)
+	}
+
+	// Upload 3: explicit new POTA ref should overwrite the old one
+	contacts3 := []Contact{
+		{
+			Date: 27000, Time: 600, FromID: fromId, ToID: toId,
+			Band: 8, Mode: 29,
+			MyPOTA: "K-1234",
+		},
+	}
+	err = bulkInsertContacts(db, contacts3, metaId)
+	if err != nil {
+		t.Fatalf("insert upload 3: %v", err)
+	}
+
+	err = db.QueryRow("SELECT my_pota, my_iota FROM contacts WHERE id = ?", id).Scan(&pota, &iota_)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !pota.Valid || pota.String != "K-1234" {
+		t.Fatalf("POTA should be updated to K-1234, got %v", pota)
+	}
+	if !iota_.Valid || iota_.String != "NA-148" {
+		t.Fatalf("IOTA should still be NA-148, got %v", iota_)
+	}
+}
+
+func TestBulkInsertContactsCustomSig(t *testing.T) {
+	db := setupTestDB(t)
+
+	metaId, _ := insertAdifMetadata(db, 1000, "hash1", "3.1.4", "test", "1.0")
+	fromId, _ := addCallsign(db, "W1AW")
+	toId, _ := addCallsign(db, "K3LR")
+
+	// Upload with a custom sig that isn't POTA/SOTA/WWFF/IOTA
+	contacts := []Contact{
+		{
+			Date: 27000, Time: 600, FromID: fromId, ToID: toId,
+			Band: 8, Mode: 29,
+			MySig: "BOTA", MySigInfo: "ENG-0042",
+		},
+	}
+	err := bulkInsertContacts(db, contacts, metaId)
+	if err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	id := contacts[0].ID
+
+	var sig, sigInfo, pota, sota, wwff, iota_ sql.NullString
+	err = db.QueryRow(
+		"SELECT my_sig, my_sig_info, my_pota, my_sota, my_wwff, my_iota FROM contacts WHERE id = ?",
+		id,
+	).Scan(&sig, &sigInfo, &pota, &sota, &wwff, &iota_)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !sig.Valid || sig.String != "BOTA" {
+		t.Fatalf("expected my_sig=BOTA, got %v", sig)
+	}
+	if !sigInfo.Valid || sigInfo.String != "ENG-0042" {
+		t.Fatalf("expected my_sig_info=ENG-0042, got %v", sigInfo)
+	}
+
+	// Custom sig should not populate any of the dedicated fields
+	for name, val := range map[string]sql.NullString{
+		"my_pota": pota, "my_sota": sota, "my_wwff": wwff, "my_iota": iota_,
+	} {
+		if val.Valid {
+			t.Fatalf("expected %s=NULL for custom sig, got %v", name, val)
+		}
+	}
+
+	// Second upload adds POTA alongside the custom sig
+	contacts2 := []Contact{
+		{
+			Date: 27000, Time: 600, FromID: fromId, ToID: toId,
+			Band: 8, Mode: 29,
+			MyPOTA: "K-0059",
+		},
+	}
+	err = bulkInsertContacts(db, contacts2, metaId)
+	if err != nil {
+		t.Fatalf("insert upload 2: %v", err)
+	}
+
+	err = db.QueryRow(
+		"SELECT my_sig, my_sig_info, my_pota FROM contacts WHERE id = ?", id,
+	).Scan(&sig, &sigInfo, &pota)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Custom sig preserved, POTA filled in
+	if !sig.Valid || sig.String != "BOTA" {
+		t.Fatalf("custom sig should survive, got %v", sig)
+	}
+	if !sigInfo.Valid || sigInfo.String != "ENG-0042" {
+		t.Fatalf("custom sig_info should survive, got %v", sigInfo)
+	}
+	if !pota.Valid || pota.String != "K-0059" {
+		t.Fatalf("POTA should be filled, got %v", pota)
+	}
+}
+
 func TestFindPotentialMatches(t *testing.T) {
 	db := setupTestDB(t)
 

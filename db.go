@@ -10,6 +10,13 @@ import (
 // SQLite 3.32.0+ SQLITE_MAX_VARIABLE_NUMBER default.
 const maxParams = 32766
 
+func nilIfEmpty(s string) any {
+	if s == "" {
+		return nil
+	}
+	return s
+}
+
 // buildMultiRowSQL builds "PREFIX (?,?,...), (?,?,...), ... SUFFIX" for n rows of cols columns.
 func buildMultiRowSQL(prefix string, cols int, n int, suffix string) string {
 	placeholder := "(" + strings.Repeat("?,", cols-1) + "?)"
@@ -60,6 +67,12 @@ func initDatabase(db *sql.DB) error {
 			zone_cq INTEGER,
 			zone_itu INTEGER,
 			tx_power INTEGER,
+			my_pota TEXT,
+			my_sota TEXT,
+			my_wwff TEXT,
+			my_iota TEXT,
+			my_sig TEXT,
+			my_sig_info TEXT,
 			UNIQUE(to_id, date, time, from_id)
 		)`)
 	if err != nil {
@@ -238,7 +251,7 @@ func bulkInsertContacts(db *sql.DB, contacts []Contact, adifMetadataId int64) er
 		return nil
 	}
 
-	const cols = 17
+	const cols = 23
 	const chunk = maxParams / cols
 
 	tx, err := db.Begin()
@@ -247,8 +260,8 @@ func bulkInsertContacts(db *sql.DB, contacts []Contact, adifMetadataId int64) er
 	}
 	defer tx.Rollback()
 
-	const prefix = `INSERT INTO contacts (adif_metadata_id, date, time, time_off, from_id, to_id, band, mode, sub_mode, grid, grid_size, administrative_primary, administrative_secondary, dxcc, zone_cq, zone_itu, tx_power) VALUES `
-	const suffix = ` ON CONFLICT(to_id, date, time, from_id) DO UPDATE SET adif_metadata_id=excluded.adif_metadata_id, time_off=excluded.time_off, band=excluded.band, mode=excluded.mode, grid=excluded.grid, grid_size=excluded.grid_size, administrative_primary=excluded.administrative_primary, administrative_secondary=excluded.administrative_secondary, dxcc=excluded.dxcc, zone_cq=excluded.zone_cq, zone_itu=excluded.zone_itu, tx_power=excluded.tx_power RETURNING id`
+	const prefix = `INSERT INTO contacts (adif_metadata_id, date, time, time_off, from_id, to_id, band, mode, sub_mode, grid, grid_size, administrative_primary, administrative_secondary, dxcc, zone_cq, zone_itu, tx_power, my_pota, my_sota, my_wwff, my_iota, my_sig, my_sig_info) VALUES `
+	const suffix = ` ON CONFLICT(to_id, date, time, from_id) DO UPDATE SET adif_metadata_id=excluded.adif_metadata_id, time_off=excluded.time_off, band=excluded.band, mode=excluded.mode, grid=excluded.grid, grid_size=excluded.grid_size, administrative_primary=excluded.administrative_primary, administrative_secondary=excluded.administrative_secondary, dxcc=excluded.dxcc, zone_cq=excluded.zone_cq, zone_itu=excluded.zone_itu, tx_power=excluded.tx_power, my_pota=COALESCE(excluded.my_pota,contacts.my_pota), my_sota=COALESCE(excluded.my_sota,contacts.my_sota), my_wwff=COALESCE(excluded.my_wwff,contacts.my_wwff), my_iota=COALESCE(excluded.my_iota,contacts.my_iota), my_sig=COALESCE(excluded.my_sig,contacts.my_sig), my_sig_info=COALESCE(excluded.my_sig_info,contacts.my_sig_info) RETURNING id`
 
 	fullSQL := buildMultiRowSQL(prefix, cols, chunk, suffix)
 
@@ -285,6 +298,12 @@ func bulkInsertContacts(db *sql.DB, contacts []Contact, adifMetadataId int64) er
 				c.ZoneCQ,
 				c.ZoneITU,
 				c.TransmitPower,
+				nilIfEmpty(c.MyPOTA),
+				nilIfEmpty(c.MySOTA),
+				nilIfEmpty(c.MyWWFF),
+				nilIfEmpty(c.MyIOTA),
+				nilIfEmpty(c.MySig),
+				nilIfEmpty(c.MySigInfo),
 			)
 		}
 

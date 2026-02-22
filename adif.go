@@ -11,27 +11,6 @@ import (
 	"github.com/skrushinsky/scaliger/julian"
 )
 
-type WWFF struct {
-	Program int
-	Number  int
-}
-
-type POTA struct {
-	Country   int
-	Reference int
-}
-
-type IOTA struct {
-	Continent  int
-	Designator int
-}
-
-type SOTA struct {
-	ITU         int
-	Subdivision int
-	Reference   int
-}
-
 type Contact struct {
 	ID                      int64
 	Date                    int
@@ -49,13 +28,13 @@ type Contact struct {
 	DXCC                    int
 	AdministrativePrimary   string
 	AdministrativeSecondary string
-	SignalReportReceived    int
-	SignalReportSent        int
 	TransmitPower           int
-	POTA                    POTA
-	IOTA                    IOTA
-	SOTA                    SOTA
-	WWFF                    WWFF
+	MyPOTA                  string
+	MySOTA                  string
+	MyWWFF                  string
+	MyIOTA                  string
+	MySig                   string
+	MySigInfo               string
 }
 
 var Modes = map[string]int{
@@ -627,14 +606,6 @@ func recordToContact(
 		}
 	}
 
-	//mySig, ok := record.Get(spec.MySigField.Name)
-	//if ok {
-	//        mySigInfo, ok := record.Get(spec.MySigInfoField.Name)
-	//        if ok {
-	//                fmt.Printf("%s: %s\n", mySig.Value, mySigInfo.Value)
-	//        }
-	//}
-
 	timeOn, ok := record.Get(spec.TimeOnField.Name)
 	if ok {
 		contact.Time, err = timeStringToMinutesFromMidnight(timeOn.Value)
@@ -708,12 +679,40 @@ func recordToContact(
 		}
 	}
 
-	//SignalReportReceived    int
-	//SignalReportSent        int
-	//POTA                    POTA
-	//IOTA                    IOTA
-	//SOTA                    SOTA
-	//WWFF                    WWFF
+	if v, ok := record.Get(spec.MyPotaRefField.Name); ok && v.Value != "" {
+		contact.MyPOTA = v.Value
+	}
+	if v, ok := record.Get(spec.MySotaRefField.Name); ok && v.Value != "" {
+		contact.MySOTA = v.Value
+	}
+	if v, ok := record.Get(spec.MyWwffRefField.Name); ok && v.Value != "" {
+		contact.MyWWFF = v.Value
+	}
+	if v, ok := record.Get(spec.MyIotaField.Name); ok && v.Value != "" {
+		contact.MyIOTA = v.Value
+	}
+
+	if v, ok := record.Get(spec.MySigField.Name); ok && v.Value != "" {
+		contact.MySig = v.Value
+		if v, ok := record.Get(spec.MySigInfoField.Name); ok && v.Value != "" {
+			contact.MySigInfo = v.Value
+		}
+
+		// Fall back to MY_SIG/MY_SIG_INFO when dedicated field is absent
+		sigUpper := strings.ToUpper(contact.MySig)
+		if contact.MyPOTA == "" && sigUpper == "POTA" {
+			contact.MyPOTA = contact.MySigInfo
+		}
+		if contact.MySOTA == "" && sigUpper == "SOTA" {
+			contact.MySOTA = contact.MySigInfo
+		}
+		if contact.MyWWFF == "" && sigUpper == "WWFF" {
+			contact.MyWWFF = contact.MySigInfo
+		}
+		if contact.MyIOTA == "" && sigUpper == "IOTA" {
+			contact.MyIOTA = contact.MySigInfo
+		}
+	}
 
 	return contact, err
 }
