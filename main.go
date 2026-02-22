@@ -29,7 +29,6 @@ import (
 // 4. Query the sqlite database where toId=the callsign ID of the file and time range between min/max extent
 // 5. Find matches and insert those matches into the matches table
 
-// TODO handle up to 10 character grids, support MY_GRIDSQUARE_EXT
 // TODO IOTA: MY_IOTA (or MY_SIG + MY_SIG_INFO?) (MY_IOTA_ISLAND_ID seems undocumented and unused)
 // TODO POTA: MY_POTA_REF (or MY_SIG + MY_SIG_INFO)
 // TODO SOTA: MY_SOTA_REF (or MY_SIG + MY_SIG_INFO?)

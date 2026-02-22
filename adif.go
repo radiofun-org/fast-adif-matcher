@@ -598,11 +598,16 @@ func recordToContact(
 	}
 
 	grid, ok := record.Get(spec.MyGridsquareField.Name)
-	if ok && (len(grid.Value) == 4 || len(grid.Value) == 6 || len(grid.Value) == 8) {
-		contact.Grid = maidenheadToNumber(grid.Value)
-		contact.GridSize = len(grid.Value)
-		if contact.GridSize == 8 {
-			contact.GridSize = 6
+	if ok {
+		gridValue := grid.Value
+		gridExt, hasExt := record.Get(spec.MyGridsquareExtField.Name)
+		if hasExt && gridExt.Value != "" {
+			gridValue += gridExt.Value
+		}
+		gridLen := len(gridValue)
+		if gridLen >= 4 && gridLen <= 12 && gridLen%2 == 0 {
+			contact.Grid = maidenheadToNumber(gridValue)
+			contact.GridSize = gridLen
 		}
 	}
 
