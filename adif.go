@@ -11,13 +11,18 @@ import (
 	"github.com/skrushinsky/scaliger/julian"
 )
 
+// Contact is the compact in-memory representation of an ADIF QSO record.
+// Categorical fields (Band, Mode, etc.) are stored as integer IDs that map
+// to the lookup tables below. Date is days since 1950-01-01, Time is minutes
+// from midnight. Grid is a Maidenhead locator encoded as a single integer
+// (see maidenhead.go).
 type Contact struct {
 	ID                      int64
-	Date                    int
-	Time                    int
+	Date                    int // days since 1950-01-01 (Julian difference)
+	Time                    int // minutes from midnight (0–1439)
 	TimeOff                 int
-	FromID                  int64
-	ToID                    int64
+	FromID                  int64 // callsign ID of the log owner
+	ToID                    int64 // callsign ID of the other station
 	Band                    int
 	Mode                    int
 	SubMode                 int
@@ -26,8 +31,8 @@ type Contact struct {
 	ZoneCQ                  int
 	ZoneITU                 int
 	DXCC                    int
-	AdministrativePrimary   string
-	AdministrativeSecondary string
+	AdministrativePrimary   string // state/province
+	AdministrativeSecondary string // county
 	TransmitPower           int
 	MyPOTA                  string
 	MySOTA                  string
@@ -36,6 +41,10 @@ type Contact struct {
 	MySig                   string
 	MySigInfo               string
 }
+
+// Modes, SubModes, ModeGroups, and Bands map ADIF enumeration strings to
+// compact integer IDs for database storage. Entries marked "not an actual
+// ADIF mode" are non-standard values commonly found in real-world log files.
 
 var Modes = map[string]int{
 	"AM":           1,
@@ -406,6 +415,9 @@ var ModeGroups = map[string]string{
 	"MTONE":        "DATA",
 }
 
+// ModeGroupsById is populated at startup from ModeGroups + Modes.
+// Used during matching: two contacts with different modes still match
+// if they share a mode group (e.g. FT8 and FT4 are both "DATA").
 var ModeGroupsById = map[int]string{}
 
 var Bands = map[string]int{
@@ -444,9 +456,12 @@ var Bands = map[string]int{
 	"submm":  32,
 }
 
+// StartJulian is the epoch for the Date field: 1950-01-01.
+// Dates are stored as the number of days since this epoch, which fits
+// in a Postgres SMALLINT for dates through ~2039.
 var StartJulian = julian.CivilToJulian(julian.CivilDate{Year: 1950, Month: 1, Day: 1})
 
-var Numeric = regexp.MustCompile(`^\d+`)
+var numericPrefix = regexp.MustCompile(`^\d+`)
 
 func dateStringToJulianDifference(date string) (int, error) {
 	if len(date) != 8 {
@@ -495,14 +510,15 @@ func timeStringToMinutesFromMidnight(time string) (int, error) {
 	return hours*60 + minutes, nil
 }
 
-func inferBand(r *adif.Record, name string) bool {
-	freqname := spec.FreqField.Name
-
-	if name == spec.BandRxField.Name {
-		freqname = spec.FreqRxField.Name
+// inferBand sets the band field on a record by looking up its frequency
+// against the ADIF band plan. Some loggers omit BAND but include FREQ.
+func inferBand(r *adif.Record, bandField string) bool {
+	freqField := spec.FreqField.Name
+	if bandField == spec.BandRxField.Name {
+		freqField = spec.FreqRxField.Name
 	}
 
-	f, ok := r.Get(freqname)
+	f, ok := r.Get(freqField)
 	if !ok || f.Value == "" {
 		return false
 	}
@@ -513,20 +529,19 @@ func inferBand(r *adif.Record, name string) bool {
 	}
 
 	for _, b := range spec.BandEnumeration.Values {
-		bb := b.(spec.BandEnum)
+		band := b.(spec.BandEnum)
 
-		_min, err := strconv.ParseFloat(bb.LowerFreqMhz, 64)
+		lower, err := strconv.ParseFloat(band.LowerFreqMhz, 64)
+		if err != nil {
+			return false
+		}
+		upper, err := strconv.ParseFloat(band.UpperFreqMhz, 64)
 		if err != nil {
 			return false
 		}
 
-		_max, err := strconv.ParseFloat(bb.UpperFreqMhz, 64)
-		if err != nil {
-			return false
-		}
-
-		if _min <= freq && freq <= _max {
-			_ = r.Set(adif.Field{Name: name, Value: bb.Band})
+		if lower <= freq && freq <= upper {
+			_ = r.Set(adif.Field{Name: bandField, Value: band.Band})
 			return true
 		}
 	}
@@ -534,123 +549,108 @@ func inferBand(r *adif.Record, name string) bool {
 	return false
 }
 
+// recordToContact converts a parsed ADIF record into a Contact, resolving
+// callsigns to database IDs and mapping categorical fields to integer codes.
 func recordToContact(
 	fromId int64,
 	record *adif.Record,
-	callsInDatabase map[string]int64,
+	callsInDB map[string]int64,
 ) (Contact, error) {
-	contact := Contact{
-		FromID: fromId,
-	}
-
+	contact := Contact{FromID: fromId}
 	var err error
 
+	// -- Required: contacted station callsign --
 	call, ok := record.Get(spec.CallField.Name)
-	if ok {
-		contact.ToID, ok = callsInDatabase[call.Value]
-		if !ok || contact.ToID == 0 {
-			return contact, fmt.Errorf("can't find call '%s'\n", call.Value)
-		}
-	} else {
-		return contact, fmt.Errorf("can't find CALL in record %s\n", record)
+	if !ok {
+		return contact, fmt.Errorf("missing CALL in record %s", record)
+	}
+	contact.ToID = callsInDB[call.Value]
+	if contact.ToID == 0 {
+		return contact, fmt.Errorf("unknown callsign %q", call.Value)
 	}
 
-	band, ok := record.Get(spec.BandField.Name)
-	if ok {
-		contact.Band, ok = Bands[strings.ToLower(band.Value)]
-	} else {
-		ok = inferBand(record, spec.BandField.Name)
-		if ok {
-			band, ok = record.Get(spec.BandField.Name)
-			if ok {
-				contact.Band, ok = Bands[band.Value]
-			}
+	// -- Band: try the field directly, fall back to inferring from frequency --
+	if band, ok := record.Get(spec.BandField.Name); ok {
+		contact.Band = Bands[strings.ToLower(band.Value)]
+	} else if inferBand(record, spec.BandField.Name) {
+		if band, ok := record.Get(spec.BandField.Name); ok {
+			contact.Band = Bands[band.Value]
 		}
 	}
 
-	date, ok := record.Get(spec.QsoDateField.Name)
-	if ok {
+	// -- Date and time --
+	if date, ok := record.Get(spec.QsoDateField.Name); ok {
 		contact.Date, err = dateStringToJulianDifference(date.Value)
 		if err != nil {
-			return contact, fmt.Errorf("Error parsing date value: %v\n", err)
+			return contact, fmt.Errorf("bad date %q: %v", date.Value, err)
 		}
 	}
-
-	grid, ok := record.Get(spec.MyGridsquareField.Name)
-	if ok {
-		gridValue := grid.Value
-		gridExt, hasExt := record.Get(spec.MyGridsquareExtField.Name)
-		if hasExt && gridExt.Value != "" {
-			gridValue += gridExt.Value
-		}
-		gridLen := len(gridValue)
-		if gridLen >= 4 && gridLen <= 12 && gridLen%2 == 0 {
-			contact.Grid = maidenheadToNumber(gridValue)
-			contact.GridSize = gridLen
-		}
-	}
-
-	mode, ok := record.Get(spec.ModeField.Name)
-	if ok {
-		contact.Mode, ok = Modes[strings.ToUpper(mode.Value)]
-		if !ok {
-			return contact, fmt.Errorf("missing mode: %s\n", mode.Value)
-		}
-	}
-
-	subMode, ok := record.Get(spec.SubmodeField.Name)
-	if ok {
-		contact.SubMode, ok = SubModes[strings.ToUpper(subMode.Value)]
-		if !ok {
-			return contact, fmt.Errorf("missing submode: %s\n", subMode.Value)
-		}
-	}
-
-	timeOn, ok := record.Get(spec.TimeOnField.Name)
-	if ok {
+	if timeOn, ok := record.Get(spec.TimeOnField.Name); ok {
 		contact.Time, err = timeStringToMinutesFromMidnight(timeOn.Value)
 		if err != nil {
-			return contact, fmt.Errorf("error parsing timeOn value: %v\n", err)
+			return contact, fmt.Errorf("bad time_on %q: %v", timeOn.Value, err)
 		}
 	}
 
-	zoneCq, ok := record.Get(spec.MyCqZoneField.Name)
-	if ok && zoneCq.Value != "" {
-		contact.ZoneCQ, err = strconv.Atoi(zoneCq.Value)
+	// -- Grid: concatenate base + extension, encode as integer --
+	if grid, ok := record.Get(spec.MyGridsquareField.Name); ok {
+		gridValue := grid.Value
+		if ext, ok := record.Get(spec.MyGridsquareExtField.Name); ok && ext.Value != "" {
+			gridValue += ext.Value
+		}
+		if n := len(gridValue); n >= 4 && n <= 12 && n%2 == 0 {
+			contact.Grid = maidenheadToNumber(gridValue)
+			contact.GridSize = n
+		}
+	}
+
+	// -- Mode / submode --
+	if mode, ok := record.Get(spec.ModeField.Name); ok {
+		contact.Mode, ok = Modes[strings.ToUpper(mode.Value)]
+		if !ok {
+			return contact, fmt.Errorf("unknown mode %q", mode.Value)
+		}
+	}
+	if subMode, ok := record.Get(spec.SubmodeField.Name); ok {
+		contact.SubMode, ok = SubModes[strings.ToUpper(subMode.Value)]
+		if !ok {
+			return contact, fmt.Errorf("unknown submode %q", subMode.Value)
+		}
+	}
+
+	// -- Zones --
+	if v, ok := record.Get(spec.MyCqZoneField.Name); ok && v.Value != "" {
+		contact.ZoneCQ, err = strconv.Atoi(v.Value)
 		if err != nil {
-			return contact, fmt.Errorf("error parsing zoneCq value: %v\n", err)
+			return contact, fmt.Errorf("bad CQ zone %q: %v", v.Value, err)
 		}
 	}
-
-	zoneItu, ok := record.Get(spec.MyItuZoneField.Name)
-	if ok && zoneItu.Value != "" {
-		contact.ZoneITU, err = strconv.Atoi(zoneItu.Value)
+	if v, ok := record.Get(spec.MyItuZoneField.Name); ok && v.Value != "" {
+		contact.ZoneITU, err = strconv.Atoi(v.Value)
 		if err != nil {
-			return contact, fmt.Errorf("error parsing zoneItu value: %v\n", err)
+			return contact, fmt.Errorf("bad ITU zone %q: %v", v.Value, err)
 		}
 	}
 
-	administrativePrimary, ok := record.Get(spec.MyStateField.Name)
-	if ok && administrativePrimary.Value != "" {
-		contact.AdministrativePrimary = administrativePrimary.Value
+	// -- State and county --
+	// ADIF MY_CNTY is formatted as "ST,County Name" (e.g. "CO,Denver").
+	// We strip the state prefix when MY_STATE is already set, and discard
+	// the pair entirely if the county's embedded state code doesn't match
+	// MY_STATE (indicates corrupt data).
+	if v, ok := record.Get(spec.MyStateField.Name); ok && v.Value != "" {
+		contact.AdministrativePrimary = v.Value
 	}
-
-	administrativeSecondary, ok := record.Get(spec.MyCntyField.Name)
-	if ok && administrativeSecondary.Value != "" && administrativeSecondary.Value != "USA" {
+	if v, ok := record.Get(spec.MyCntyField.Name); ok && v.Value != "" && v.Value != "USA" {
+		county := v.Value
 		if contact.AdministrativePrimary != "" {
 			prefix := contact.AdministrativePrimary + ","
-			if strings.HasPrefix(administrativeSecondary.Value, prefix) {
-				contact.AdministrativeSecondary = strings.TrimLeft(
-					administrativeSecondary.Value[len(prefix):],
-					" ",
-				)
-			} else {
-				contact.AdministrativeSecondary = administrativeSecondary.Value
+			if strings.HasPrefix(county, prefix) {
+				county = strings.TrimLeft(county[len(prefix):], " ")
 			}
-		} else {
-			contact.AdministrativeSecondary = administrativeSecondary.Value
 		}
+		contact.AdministrativeSecondary = county
 
+		// Sanity check: if the county contains "XX,..." and XX != state, discard both.
 		if len(contact.AdministrativePrimary) == 2 &&
 			len(contact.AdministrativeSecondary) >= 3 &&
 			contact.AdministrativeSecondary[2] == ',' &&
@@ -660,25 +660,25 @@ func recordToContact(
 		}
 	}
 
-	transmitPower, ok := record.Get(spec.TxPwrField.Name)
-	if ok && transmitPower.Value != "" {
-		match := Numeric.FindString(transmitPower.Value)
-		if match != "" {
-			contact.TransmitPower, err = strconv.Atoi(match)
+	// -- TX power: extract leading digits (handles "100W", "5", etc.) --
+	if v, ok := record.Get(spec.TxPwrField.Name); ok && v.Value != "" {
+		if digits := numericPrefix.FindString(v.Value); digits != "" {
+			contact.TransmitPower, err = strconv.Atoi(digits)
 			if err != nil {
-				return contact, fmt.Errorf("error parsing transmitPower value: %v\n", err)
+				return contact, fmt.Errorf("bad tx_pwr %q: %v", v.Value, err)
 			}
 		}
 	}
 
-	dxcc, ok := record.Get(spec.DxccField.Name)
-	if ok && dxcc.Value != "" {
-		contact.DXCC, err = strconv.Atoi(dxcc.Value)
+	// -- DXCC entity --
+	if v, ok := record.Get(spec.DxccField.Name); ok && v.Value != "" {
+		contact.DXCC, err = strconv.Atoi(v.Value)
 		if err != nil {
-			return contact, fmt.Errorf("error parsing dxcc value: %v\n", err)
+			return contact, fmt.Errorf("bad DXCC %q: %v", v.Value, err)
 		}
 	}
 
+	// -- Special activity references (POTA, SOTA, WWFF, IOTA) --
 	if v, ok := record.Get(spec.MyPotaRefField.Name); ok && v.Value != "" {
 		contact.MyPOTA = v.Value
 	}
@@ -692,25 +692,32 @@ func recordToContact(
 		contact.MyIOTA = v.Value
 	}
 
+	// Some loggers use the generic MY_SIG/MY_SIG_INFO fields instead of the
+	// dedicated MY_POTA_REF etc. If the dedicated field is empty, populate it
+	// from MY_SIG_INFO.
 	if v, ok := record.Get(spec.MySigField.Name); ok && v.Value != "" {
 		contact.MySig = v.Value
-		if v, ok := record.Get(spec.MySigInfoField.Name); ok && v.Value != "" {
-			contact.MySigInfo = v.Value
+		if info, ok := record.Get(spec.MySigInfoField.Name); ok && info.Value != "" {
+			contact.MySigInfo = info.Value
 		}
 
-		// Fall back to MY_SIG/MY_SIG_INFO when dedicated field is absent
-		sigUpper := strings.ToUpper(contact.MySig)
-		if contact.MyPOTA == "" && sigUpper == "POTA" {
-			contact.MyPOTA = contact.MySigInfo
-		}
-		if contact.MySOTA == "" && sigUpper == "SOTA" {
-			contact.MySOTA = contact.MySigInfo
-		}
-		if contact.MyWWFF == "" && sigUpper == "WWFF" {
-			contact.MyWWFF = contact.MySigInfo
-		}
-		if contact.MyIOTA == "" && sigUpper == "IOTA" {
-			contact.MyIOTA = contact.MySigInfo
+		switch strings.ToUpper(contact.MySig) {
+		case "POTA":
+			if contact.MyPOTA == "" {
+				contact.MyPOTA = contact.MySigInfo
+			}
+		case "SOTA":
+			if contact.MySOTA == "" {
+				contact.MySOTA = contact.MySigInfo
+			}
+		case "WWFF":
+			if contact.MyWWFF == "" {
+				contact.MyWWFF = contact.MySigInfo
+			}
+		case "IOTA":
+			if contact.MyIOTA == "" {
+				contact.MyIOTA = contact.MySigInfo
+			}
 		}
 	}
 

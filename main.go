@@ -33,6 +33,10 @@ func abs(x int) int {
 	return x
 }
 
+// withinThirtyMinutes checks whether two contacts occurred within 30 minutes
+// of each other, handling the midnight boundary where one contact might be
+// just before 00:00 and the other just after. Time is stored as minutes
+// from midnight (0–1439), so a day boundary requires wrapping arithmetic.
 func withinThirtyMinutes(a Contact, b Contact) bool {
 	if abs(a.Date-b.Date) > 1 {
 		return false
@@ -46,15 +50,21 @@ func withinThirtyMinutes(a Contact, b Contact) bool {
 	return abs(a.Time-b.Time) <= 30
 }
 
+// process is the core pipeline for an ADIF log file:
+//  1. Parse the file and compute its SHA-256 (for dedup)
+//  2. Ensure all callsigns exist in the database
+//  3. Convert ADIF records to compact Contact structs and bulk-insert them
+//  4. Find matching QSOs — contacts already in the DB where the other station
+//     logged the same QSO (same band, compatible mode, within 30 minutes)
 func process(ctx context.Context, pool *pgxpool.Pool, filename string, callsign string) {
 	debug.SetGCPercent(-1)
 	start := time.Now()
 
-	var adifIo adif.Reader
+	var adifReader adif.Reader
 	if strings.EqualFold(filepath.Ext(filename), ".adx") {
-		adifIo = adif.NewADXIO()
+		adifReader = adif.NewADXIO()
 	} else {
-		adifIo = adif.NewADIIO()
+		adifReader = adif.NewADIIO()
 	}
 
 	f, err := os.Open(filename)
@@ -63,9 +73,7 @@ func process(ctx context.Context, pool *pgxpool.Pool, filename string, callsign 
 	}
 
 	hasher := sha256.New()
-	reader := io.TeeReader(f, hasher)
-
-	logfile, err := adifIo.Read(reader)
+	logfile, err := adifReader.Read(io.TeeReader(f, hasher))
 	if err != nil {
 		log.Panic(err)
 	}
@@ -86,49 +94,46 @@ func process(ctx context.Context, pool *pgxpool.Pool, filename string, callsign 
 		log.Panic(err)
 	}
 
+	// Collect all unique callsigns from the file and ensure they exist in the DB.
 	calls := mapset.NewSet[string]()
 	calls.Add(callsign)
-
 	for _, record := range logfile.Records {
-		call, ok := record.Get(spec.CallField.Name)
-		if ok {
+		if call, ok := record.Get(spec.CallField.Name); ok {
 			calls.Add(call.Value)
 		}
 	}
 
 	callsInFile := calls.ToSlice()
 
-	callsInDatabase, err := queryCallsigns(ctx, pool, callsInFile)
+	callsInDB, err := queryCallsigns(ctx, pool, callsInFile)
+	if err != nil {
+		log.Panic(err)
+	}
+	callsInDB, err = bulkInsertCallsigns(ctx, pool, callsInFile, callsInDB)
 	if err != nil {
 		log.Panic(err)
 	}
 
-	callsInDatabase, err = bulkInsertCallsigns(ctx, pool, callsInFile, callsInDatabase)
-	if err != nil {
-		log.Panic(err)
-	}
+	fromId := callsInDB[callsign]
 
-	fromId := callsInDatabase[callsign]
-
-	var dateStart = math.MaxInt
-	var dateEnd = math.MinInt
-
+	// Convert ADIF records to Contact structs, tracking the date range
+	// so we can scope the reverse-lookup query.
+	dateStart := math.MaxInt
+	dateEnd := math.MinInt
 	var contacts []Contact
 
 	for _, record := range logfile.Records {
-		contact, err := recordToContact(fromId, record, callsInDatabase)
+		contact, err := recordToContact(fromId, record, callsInDB)
 		if err != nil {
 			fmt.Printf("error converting record: %v\n", err)
 			continue
 		}
-
 		if contact.Date < dateStart {
 			dateStart = contact.Date
 		}
 		if contact.Date > dateEnd {
 			dateEnd = contact.Date
 		}
-
 		contacts = append(contacts, contact)
 	}
 
@@ -137,6 +142,10 @@ func process(ctx context.Context, pool *pgxpool.Pool, filename string, callsign 
 		log.Panic(err)
 	}
 
+	// Match against existing contacts in the DB. findPotentialMatches returns
+	// contacts where someone else logged a QSO *to* this callsign in the same
+	// date range. We index the file's contacts by ToID so we can efficiently
+	// check each potential match against the right subset.
 	potentialMatches, err := findPotentialMatches(ctx, pool, fromId, dateStart-1, dateEnd+1)
 	if err != nil {
 		log.Panic(err)
@@ -150,45 +159,44 @@ func process(ctx context.Context, pool *pgxpool.Pool, filename string, callsign 
 	matchedAt := time.Now().Unix()
 	var matches []matchRecord
 
-	for _, dbRecord := range potentialMatches {
-		candidates, ok := contactsByToID[dbRecord.FromID]
+	for _, dbContact := range potentialMatches {
+		candidates, ok := contactsByToID[dbContact.FromID]
 		if !ok {
 			continue
 		}
 
-		for _, fileRecord := range candidates {
-			if dbRecord.Band != fileRecord.Band {
+		for _, fileContact := range candidates {
+			if dbContact.Band != fileContact.Band {
+				continue
+			}
+			if !withinThirtyMinutes(dbContact, fileContact) {
 				continue
 			}
 
-			if !withinThirtyMinutes(dbRecord, fileRecord) {
-				continue
-			}
-
-			if dbRecord.Mode != fileRecord.Mode {
-				modeGroupFrom, ok := ModeGroupsById[dbRecord.Mode]
-				if !ok {
-					fmt.Printf("Missing mode group: %v\n", dbRecord.Mode)
+			// Modes must match exactly, or at least belong to the same
+			// mode group (e.g. FT8 and FT4 are both DATA).
+			if dbContact.Mode != fileContact.Mode {
+				dbGroup, ok1 := ModeGroupsById[dbContact.Mode]
+				fileGroup, ok2 := ModeGroupsById[fileContact.Mode]
+				if !ok1 {
+					fmt.Printf("Missing mode group: %v\n", dbContact.Mode)
 					continue
 				}
-
-				modeGroupTo, ok := ModeGroupsById[fileRecord.Mode]
-				if !ok {
-					fmt.Printf("Missing mode group: %v\n", fileRecord.Mode)
+				if !ok2 {
+					fmt.Printf("Missing mode group: %v\n", fileContact.Mode)
 					continue
 				}
-
-				if modeGroupFrom != modeGroupTo {
+				if dbGroup != fileGroup {
 					continue
 				}
 			}
 
 			matches = append(matches, matchRecord{
 				MatchedAt: matchedAt,
-				AID:       dbRecord.ID,
-				BID:       fileRecord.ID,
-				ACallID:   dbRecord.FromID,
-				BCallID:   fileRecord.FromID,
+				AID:       dbContact.ID,
+				BID:       fileContact.ID,
+				ACallID:   dbContact.FromID,
+				BCallID:   fileContact.FromID,
 			})
 		}
 	}
@@ -199,7 +207,6 @@ func process(ctx context.Context, pool *pgxpool.Pool, filename string, callsign 
 	}
 
 	duration := time.Since(start)
-
 	fmt.Printf(
 		"%-16s Processed %d contacts in %dms at %fms/contact, found %d matches\n",
 		filepath.Base(filename),

@@ -154,6 +154,9 @@ func queryCallsigns(
 	return result, rows.Err()
 }
 
+// bulkInsertCallsigns inserts any callsigns not already in `existing` using
+// the COPY + temp table pattern for speed. Returns the updated map with all
+// callsign→ID mappings.
 func bulkInsertCallsigns(
 	ctx context.Context,
 	pool *pgxpool.Pool,
@@ -221,6 +224,12 @@ func bulkInsertCallsigns(
 	return existing, nil
 }
 
+// bulkInsertContacts upserts contacts using COPY into a temp table followed
+// by INSERT ... ON CONFLICT. The upsert uses COALESCE for special activity
+// fields (POTA, SOTA, WWFF, IOTA, SIG) so that re-uploading a log with
+// different activity references merges them rather than overwriting with NULLs.
+// The _ord column preserves insertion order so we can map returned IDs back
+// to the original slice.
 func bulkInsertContacts(
 	ctx context.Context,
 	pool *pgxpool.Pool,
@@ -354,6 +363,9 @@ func bulkInsertContacts(
 	return tx.Commit(ctx)
 }
 
+// findPotentialMatches returns contacts already in the DB where someone else
+// logged a QSO *to* the given callsign within the given date range. These are
+// candidates for matching against the contacts being imported.
 func findPotentialMatches(
 	ctx context.Context,
 	pool *pgxpool.Pool,
