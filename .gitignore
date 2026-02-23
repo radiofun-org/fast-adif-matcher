@@ -3,3 +3,4 @@ fast-matcher
 *.prof
 *.sqlite*
 .env
+adif-spec/

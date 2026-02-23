@@ -29,6 +29,44 @@ import (
 //	10 chars:        1,075,274,240,000    ~19 m    × ~39 m
 //	12 chars:      107,527,424,000,000    ~2 m     × ~4 m
 
+// latLonToMaidenhead converts decimal latitude and longitude to a 6-character
+// Maidenhead grid locator.
+func latLonToMaidenhead(lat, lon float64) string {
+	// Offset so that (−90, −180) maps to (0, 0)
+	lon += 180
+	lat += 90
+
+	// Field: 18 divisions of 20° lon, 10° lat
+	fieldLon := int(lon / 20)
+	fieldLat := int(lat / 10)
+	lon -= float64(fieldLon) * 20
+	lat -= float64(fieldLat) * 10
+
+	// Square: 10 divisions of 2° lon, 1° lat
+	sqLon := int(lon / 2)
+	sqLat := int(lat / 1)
+	lon -= float64(sqLon) * 2
+	lat -= float64(sqLat) * 1
+
+	// Subsquare: 24 divisions of 5' lon, 2.5' lat
+	subLon := int(lon / (2.0 / 24))
+	subLat := int(lat / (1.0 / 24))
+
+	// Clamp to valid ranges
+	if subLon > 23 {
+		subLon = 23
+	}
+	if subLat > 23 {
+		subLat = 23
+	}
+
+	return fmt.Sprintf("%c%c%d%d%c%c",
+		'A'+fieldLon, 'A'+fieldLat,
+		sqLon, sqLat,
+		'a'+subLon, 'a'+subLat,
+	)
+}
+
 func maidenheadToNumber(locator string) int {
 	locator = strings.ToUpper(locator)
 	n := int(locator[0]-'A')*18 + int(locator[1]-'A')

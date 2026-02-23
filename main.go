@@ -33,21 +33,35 @@ func abs(x int) int {
 	return x
 }
 
-// withinThirtyMinutes checks whether two contacts occurred within 30 minutes
-// of each other, handling the midnight boundary where one contact might be
-// just before 00:00 and the other just after. Time is stored as minutes
-// from midnight (0–1439), so a day boundary requires wrapping arithmetic.
+// contactEnd returns the absolute end time in minutes for a contact.
+// If TimeOff is set and less than Time, the QSO crossed midnight.
+// If TimeOff is not set (0), the contact is treated as a single point.
+func contactEnd(c Contact) int {
+	end := c.Date*1440 + c.Time
+	if c.TimeOff > 0 {
+		end = c.Date*1440 + c.TimeOff
+		if c.TimeOff < c.Time {
+			end += 1440 // crossed midnight
+		}
+	}
+	return end
+}
+
+// withinThirtyMinutes checks whether two contacts' time ranges overlap or
+// are within 30 minutes of each other. Each contact spans [Time, TimeOff];
+// if TimeOff is 0 it's treated as a point at Time.
 func withinThirtyMinutes(a Contact, b Contact) bool {
 	if abs(a.Date-b.Date) > 1 {
 		return false
 	}
-	if a.Date < b.Date {
-		return (1440-a.Time)+b.Time <= 30
-	}
-	if a.Date > b.Date {
-		return (1440-b.Time)+a.Time <= 30
-	}
-	return abs(a.Time-b.Time) <= 30
+	aStart := a.Date*1440 + a.Time
+	aEnd := contactEnd(a)
+	bStart := b.Date*1440 + b.Time
+	bEnd := contactEnd(b)
+
+	// Gap between two intervals; 0 if they overlap.
+	gap := max(aStart, bStart) - min(aEnd, bEnd)
+	return gap <= 30
 }
 
 // process is the core pipeline for an ADIF log file:
@@ -131,8 +145,12 @@ func process(ctx context.Context, pool *pgxpool.Pool, filename string, callsign 
 		if contact.Date < dateStart {
 			dateStart = contact.Date
 		}
-		if contact.Date > dateEnd {
-			dateEnd = contact.Date
+		endDate := contact.Date
+		if contact.TimeOff > 0 && contact.TimeOff < contact.Time {
+			endDate++ // TimeOff crosses midnight
+		}
+		if endDate > dateEnd {
+			dateEnd = endDate
 		}
 		contacts = append(contacts, contact)
 	}
@@ -146,6 +164,8 @@ func process(ctx context.Context, pool *pgxpool.Pool, filename string, callsign 
 	// contacts where someone else logged a QSO *to* this callsign in the same
 	// date range. We index the file's contacts by ToID so we can efficiently
 	// check each potential match against the right subset.
+	// Pad by 1 day on each side so contacts near midnight or within the
+	// 30-minute matching window on adjacent days aren't missed.
 	potentialMatches, err := findPotentialMatches(ctx, pool, fromId, dateStart-1, dateEnd+1)
 	if err != nil {
 		log.Panic(err)
@@ -306,6 +326,13 @@ func main() {
 			continue
 		}
 		ModeGroupsById[modeId] = v
+	}
+
+	// Build submodeToMode by iterating the spec's submode enumeration.
+	// Maps e.g. "USB" → "SSB", "FT4" → "MFSK".
+	for _, v := range spec.SubmodeEnumeration.Values {
+		sub := v.(spec.SubmodeEnum)
+		submodeToMode[strings.ToUpper(sub.Submode)] = strings.ToUpper(sub.Mode)
 	}
 
 	if *profileCpu != "" {

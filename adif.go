@@ -34,7 +34,7 @@ type Contact struct {
 	AdministrativePrimary   string // state/province
 	AdministrativeSecondary string // county
 	TransmitPower           int
-	MyPOTA                  string
+	MyPOTA                  []string
 	MySOTA                  string
 	MyWWFF                  string
 	MyIOTA                  string
@@ -420,6 +420,10 @@ var ModeGroups = map[string]string{
 // if they share a mode group (e.g. FT8 and FT4 are both "DATA").
 var ModeGroupsById = map[int]string{}
 
+// submodeToMode maps submode names to their parent mode (e.g. "USB" → "SSB").
+// Populated at startup from the spec's submode enumeration.
+var submodeToMode = map[string]string{}
+
 var Bands = map[string]int{
 	"2190m":  0,
 	"630m":   1,
@@ -549,6 +553,86 @@ func inferBand(r *adif.Record, bandField string) bool {
 	return false
 }
 
+// splitPotaRefs splits a comma-separated POTA reference string (e.g.
+// "K-0059,K-1234") into individual park references.
+func splitPotaRefs(s string) []string {
+	var refs []string
+	for _, part := range strings.Split(s, ",") {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			refs = append(refs, part)
+		}
+	}
+	return refs
+}
+
+// resolveZoneByState looks up the CQ or ITU zone for a specific state within
+// a DXCC entity. Returns 0 if the state isn't found or if the zone is ambiguous
+// (e.g. "07/08" for states spanning multiple zones).
+func resolveZoneByState(dxccCode, stateCode string, cq bool) int {
+	for _, v := range spec.PrimaryAdministrativeSubdivisionEnumeration.Values {
+		sub := v.(spec.PrimaryAdministrativeSubdivisionEnum)
+		if sub.DxccEntityCode != dxccCode {
+			continue
+		}
+		if !strings.EqualFold(sub.Code, stateCode) {
+			continue
+		}
+		zoneStr := sub.ItuZone
+		if cq {
+			zoneStr = sub.CqZone
+		}
+		if strings.Contains(zoneStr, "/") {
+			return 0
+		}
+		if zone, err := strconv.Atoi(zoneStr); err == nil {
+			return zone
+		}
+		return 0
+	}
+	return 0
+}
+
+// parseADIFLocation parses an ADIF location string like "N045 20.000" or
+// "W075 30.000" into decimal degrees. The format is [NSEW]DDD MM.MMM.
+func parseADIFLocation(s string) (float64, error) {
+	s = strings.TrimSpace(s)
+	if len(s) < 2 {
+		return 0, fmt.Errorf("location too short: %q", s)
+	}
+
+	dir := strings.ToUpper(s[:1])
+	rest := strings.TrimSpace(s[1:])
+
+	parts := strings.Fields(rest)
+	if len(parts) != 2 {
+		return 0, fmt.Errorf("expected 'DDD MM.MMM', got %q", rest)
+	}
+
+	degrees, err := strconv.ParseFloat(parts[0], 64)
+	if err != nil {
+		return 0, fmt.Errorf("bad degrees %q: %v", parts[0], err)
+	}
+
+	minutes, err := strconv.ParseFloat(parts[1], 64)
+	if err != nil {
+		return 0, fmt.Errorf("bad minutes %q: %v", parts[1], err)
+	}
+
+	result := degrees + minutes/60.0
+
+	switch dir {
+	case "S", "W":
+		result = -result
+	case "N", "E":
+		// positive
+	default:
+		return 0, fmt.Errorf("unknown direction %q", dir)
+	}
+
+	return result, nil
+}
+
 // recordToContact converts a parsed ADIF record into a Contact, resolving
 // callsigns to database IDs and mapping categorical fields to integer codes.
 func recordToContact(
@@ -592,6 +676,13 @@ func recordToContact(
 		}
 	}
 
+	if timeOff, ok := record.Get(spec.TimeOffField.Name); ok {
+		contact.TimeOff, err = timeStringToMinutesFromMidnight(timeOff.Value)
+		if err != nil {
+			return contact, fmt.Errorf("bad time_off %q: %v", timeOff.Value, err)
+		}
+	}
+
 	// -- Grid: concatenate base + extension, encode as integer --
 	if grid, ok := record.Get(spec.MyGridsquareField.Name); ok {
 		gridValue := grid.Value
@@ -612,9 +703,16 @@ func recordToContact(
 		}
 	}
 	if subMode, ok := record.Get(spec.SubmodeField.Name); ok {
-		contact.SubMode, ok = SubModes[strings.ToUpper(subMode.Value)]
+		upperSubmode := strings.ToUpper(subMode.Value)
+		contact.SubMode, ok = SubModes[upperSubmode]
 		if !ok {
 			return contact, fmt.Errorf("unknown submode %q", subMode.Value)
+		}
+		// Infer mode from submode if no explicit mode was set
+		if contact.Mode == 0 {
+			if parentMode, found := submodeToMode[upperSubmode]; found {
+				contact.Mode = Modes[parentMode]
+			}
 		}
 	}
 
@@ -680,7 +778,7 @@ func recordToContact(
 
 	// -- Special activity references (POTA, SOTA, WWFF, IOTA) --
 	if v, ok := record.Get(spec.MyPotaRefField.Name); ok && v.Value != "" {
-		contact.MyPOTA = v.Value
+		contact.MyPOTA = splitPotaRefs(v.Value)
 	}
 	if v, ok := record.Get(spec.MySotaRefField.Name); ok && v.Value != "" {
 		contact.MySOTA = v.Value
@@ -703,8 +801,8 @@ func recordToContact(
 
 		switch strings.ToUpper(contact.MySig) {
 		case "POTA":
-			if contact.MyPOTA == "" {
-				contact.MyPOTA = contact.MySigInfo
+			if len(contact.MyPOTA) == 0 {
+				contact.MyPOTA = splitPotaRefs(contact.MySigInfo)
 			}
 		case "SOTA":
 			if contact.MySOTA == "" {
@@ -717,6 +815,62 @@ func recordToContact(
 		case "IOTA":
 			if contact.MyIOTA == "" {
 				contact.MyIOTA = contact.MySigInfo
+			}
+		}
+	}
+
+	// -- Field inference --
+	// Derive missing fields from other data present in the record.
+
+	// Infer DXCC from country name
+	if contact.DXCC == 0 {
+		if v, ok := record.Get(spec.CountryField.Name); ok && v.Value != "" {
+			for _, ev := range spec.CountryEnumeration.Value(v.Value) {
+				country := ev.(spec.CountryEnum)
+				if country.Deleted == "true" {
+					continue
+				}
+				if code, err := strconv.Atoi(country.EntityCode); err == nil {
+					contact.DXCC = code
+					break
+				}
+			}
+		}
+	}
+
+	// Infer CQ zone from DXCC (+ state for multi-zone countries)
+	if contact.ZoneCQ == 0 && contact.DXCC != 0 {
+		dxccStr := strconv.Itoa(contact.DXCC)
+		zones := spec.CQZoneFor(dxccStr)
+		if len(zones) == 1 {
+			contact.ZoneCQ = zones[0]
+		} else if len(zones) > 1 && contact.AdministrativePrimary != "" {
+			contact.ZoneCQ = resolveZoneByState(dxccStr, contact.AdministrativePrimary, true)
+		}
+	}
+
+	// Infer ITU zone from DXCC (+ state for multi-zone countries)
+	if contact.ZoneITU == 0 && contact.DXCC != 0 {
+		dxccStr := strconv.Itoa(contact.DXCC)
+		zones := spec.ITUZoneFor(dxccStr)
+		if len(zones) == 1 {
+			contact.ZoneITU = zones[0]
+		} else if len(zones) > 1 && contact.AdministrativePrimary != "" {
+			contact.ZoneITU = resolveZoneByState(dxccStr, contact.AdministrativePrimary, false)
+		}
+	}
+
+	// Infer grid from lat/lon
+	if contact.Grid == 0 {
+		latField, latOk := record.Get(spec.MyLatField.Name)
+		lonField, lonOk := record.Get(spec.MyLonField.Name)
+		if latOk && lonOk && latField.Value != "" && lonField.Value != "" {
+			lat, latErr := parseADIFLocation(latField.Value)
+			lon, lonErr := parseADIFLocation(lonField.Value)
+			if latErr == nil && lonErr == nil {
+				grid := latLonToMaidenhead(lat, lon)
+				contact.Grid = maidenheadToNumber(grid)
+				contact.GridSize = len(grid)
 			}
 		}
 	}

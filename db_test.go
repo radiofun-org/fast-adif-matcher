@@ -252,7 +252,7 @@ func TestBulkInsertContactsSigCoalesce(t *testing.T) {
 		{
 			Date: 27000, Time: 600, FromID: fromId, ToID: toId,
 			Band: 8, Mode: 29,
-			MyPOTA: "K-0059",
+			MyPOTA: []string{"K-0059"},
 			MySig:  "POTA", MySigInfo: "K-0059",
 		},
 	}
@@ -263,14 +263,15 @@ func TestBulkInsertContactsSigCoalesce(t *testing.T) {
 	id := contacts1[0].ID
 
 	// Verify POTA and sig fields are stored
-	var pota, iota_, sig, sigInfo *string
+	var pota []string
+	var iota_, sig, sigInfo *string
 	err = pool.QueryRow(ctx, "SELECT my_pota, my_iota, my_sig, my_sig_info FROM contacts WHERE id = $1", id).
 		Scan(&pota, &iota_, &sig, &sigInfo)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if pota == nil || *pota != "K-0059" {
-		t.Fatalf("expected my_pota=K-0059, got %v", pota)
+	if len(pota) != 1 || pota[0] != "K-0059" {
+		t.Fatalf("expected my_pota={K-0059}, got %v", pota)
 	}
 	if iota_ != nil {
 		t.Fatalf("expected my_iota=NULL, got %v", *iota_)
@@ -306,7 +307,7 @@ func TestBulkInsertContactsSigCoalesce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if pota == nil || *pota != "K-0059" {
+	if len(pota) != 1 || pota[0] != "K-0059" {
 		t.Fatalf("POTA should survive second upload, got %v", pota)
 	}
 	if iota_ == nil || *iota_ != "NA-148" {
@@ -324,7 +325,7 @@ func TestBulkInsertContactsSigCoalesce(t *testing.T) {
 		{
 			Date: 27000, Time: 600, FromID: fromId, ToID: toId,
 			Band: 8, Mode: 29,
-			MyPOTA: "K-1234",
+			MyPOTA: []string{"K-1234"},
 		},
 	}
 	err = bulkInsertContacts(ctx, pool, contacts3, metaId)
@@ -337,8 +338,8 @@ func TestBulkInsertContactsSigCoalesce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if pota == nil || *pota != "K-1234" {
-		t.Fatalf("POTA should be updated to K-1234, got %v", pota)
+	if len(pota) != 1 || pota[0] != "K-1234" {
+		t.Fatalf("POTA should be updated to {K-1234}, got %v", pota)
 	}
 	if iota_ == nil || *iota_ != "NA-148" {
 		t.Fatalf("IOTA should still be NA-148, got %v", iota_)
@@ -366,12 +367,13 @@ func TestBulkInsertContactsCustomSig(t *testing.T) {
 	}
 	id := contacts[0].ID
 
-	var sig, sigInfo, pota, sota, wwff, iota_ *string
+	var sig, sigInfo, sota, wwff, iota_ *string
+	var potaArr []string
 	err = pool.QueryRow(
 		ctx,
 		"SELECT my_sig, my_sig_info, my_pota, my_sota, my_wwff, my_iota FROM contacts WHERE id = $1",
 		id,
-	).Scan(&sig, &sigInfo, &pota, &sota, &wwff, &iota_)
+	).Scan(&sig, &sigInfo, &potaArr, &sota, &wwff, &iota_)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -383,8 +385,11 @@ func TestBulkInsertContactsCustomSig(t *testing.T) {
 		t.Fatalf("expected my_sig_info=ENG-0042, got %v", sigInfo)
 	}
 
+	if len(potaArr) != 0 {
+		t.Fatalf("expected my_pota=NULL for custom sig, got %v", potaArr)
+	}
 	for name, val := range map[string]*string{
-		"my_pota": pota, "my_sota": sota, "my_wwff": wwff, "my_iota": iota_,
+		"my_sota": sota, "my_wwff": wwff, "my_iota": iota_,
 	} {
 		if val != nil {
 			t.Fatalf("expected %s=NULL for custom sig, got %v", name, *val)
@@ -396,7 +401,7 @@ func TestBulkInsertContactsCustomSig(t *testing.T) {
 		{
 			Date: 27000, Time: 600, FromID: fromId, ToID: toId,
 			Band: 8, Mode: 29,
-			MyPOTA: "K-0059",
+			MyPOTA: []string{"K-0059"},
 		},
 	}
 	err = bulkInsertContacts(ctx, pool, contacts2, metaId)
@@ -406,7 +411,7 @@ func TestBulkInsertContactsCustomSig(t *testing.T) {
 
 	err = pool.QueryRow(ctx,
 		"SELECT my_sig, my_sig_info, my_pota FROM contacts WHERE id = $1", id,
-	).Scan(&sig, &sigInfo, &pota)
+	).Scan(&sig, &sigInfo, &potaArr)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -417,8 +422,8 @@ func TestBulkInsertContactsCustomSig(t *testing.T) {
 	if sigInfo == nil || *sigInfo != "ENG-0042" {
 		t.Fatalf("custom sig_info should survive, got %v", sigInfo)
 	}
-	if pota == nil || *pota != "K-0059" {
-		t.Fatalf("POTA should be filled, got %v", pota)
+	if len(potaArr) != 1 || potaArr[0] != "K-0059" {
+		t.Fatalf("POTA should be filled with {K-0059}, got %v", potaArr)
 	}
 }
 
@@ -499,5 +504,35 @@ func TestBulkInsertMatches(t *testing.T) {
 	pool.QueryRow(ctx, "SELECT count(*) FROM matches").Scan(&count)
 	if count != 1 {
 		t.Fatalf("expected still 1 match row after duplicate, got %d", count)
+	}
+}
+
+func TestBulkInsertContacts_MultiParkPOTA(t *testing.T) {
+	ctx, pool := setupTestDB(t)
+
+	metaId, _ := insertAdifMetadata(ctx, pool, 1000, "hash1", "3.1.4", "test", "1.0")
+	fromId, _ := addCallsign(ctx, pool, "W1AW")
+	toId, _ := addCallsign(ctx, pool, "K3LR")
+
+	contacts := []Contact{
+		{
+			Date: 27000, Time: 600, FromID: fromId, ToID: toId,
+			Band: 8, Mode: 29,
+			MyPOTA: []string{"K-0059", "K-1234"},
+		},
+	}
+	err := bulkInsertContacts(ctx, pool, contacts, metaId)
+	if err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+
+	var pota []string
+	err = pool.QueryRow(ctx, "SELECT my_pota FROM contacts WHERE id = $1", contacts[0].ID).
+		Scan(&pota)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pota) != 2 || pota[0] != "K-0059" || pota[1] != "K-1234" {
+		t.Fatalf("expected {K-0059,K-1234}, got %v", pota)
 	}
 }

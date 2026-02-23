@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 
-rm ./contacts.sqlite
+set -e
+
+export DATABASE_URL="${DATABASE_URL:-postgres://test:test@localhost:5433/fast_matcher_test}"
+
+./clear-db.sh
 
 go build
 

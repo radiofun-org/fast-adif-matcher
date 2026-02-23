@@ -41,7 +41,7 @@ func initDatabase(ctx context.Context, pool *pgxpool.Pool) error {
 			zone_cq SMALLINT,
 			zone_itu SMALLINT,
 			tx_power SMALLINT,
-			my_pota TEXT,
+			my_pota TEXT[],
 			my_sota TEXT,
 			my_wwff TEXT,
 			my_iota TEXT,
@@ -49,6 +49,17 @@ func initDatabase(ctx context.Context, pool *pgxpool.Pool) error {
 			my_sig_info TEXT,
 			UNIQUE(to_id, date, time, from_id)
 		)`)
+	if err != nil {
+		return err
+	}
+
+	// Migrate my_pota from TEXT to TEXT[] for existing databases
+	_, err = pool.Exec(ctx, `
+		DO $$ BEGIN
+			ALTER TABLE contacts ALTER COLUMN my_pota TYPE TEXT[]
+				USING CASE WHEN my_pota IS NOT NULL THEN string_to_array(my_pota, ',') ELSE NULL END;
+		EXCEPTION WHEN others THEN NULL;
+		END $$`)
 	if err != nil {
 		return err
 	}
@@ -255,7 +266,7 @@ func bulkInsertContacts(
 		grid BIGINT, grid_size SMALLINT,
 		administrative_primary TEXT, administrative_secondary TEXT,
 		dxcc SMALLINT, zone_cq SMALLINT, zone_itu SMALLINT, tx_power SMALLINT,
-		my_pota TEXT, my_sota TEXT, my_wwff TEXT, my_iota TEXT,
+		my_pota TEXT[], my_sota TEXT, my_wwff TEXT, my_iota TEXT,
 		my_sig TEXT, my_sig_info TEXT
 	) ON COMMIT DROP`)
 	if err != nil {
@@ -287,12 +298,22 @@ func bulkInsertContacts(
 				int64(c.Grid), int16(c.GridSize),
 				nilIfEmpty(c.AdministrativePrimary), nilIfEmpty(c.AdministrativeSecondary),
 				int16(c.DXCC), int16(c.ZoneCQ), int16(c.ZoneITU), int16(c.TransmitPower),
-				nilIfEmpty(c.MyPOTA), nilIfEmpty(c.MySOTA),
+				nilIfEmptySlice(c.MyPOTA), nilIfEmpty(c.MySOTA),
 				nilIfEmpty(c.MyWWFF), nilIfEmpty(c.MyIOTA),
 				nilIfEmpty(c.MySig), nilIfEmpty(c.MySigInfo),
 			}, nil
 		}),
 	)
+	if err != nil {
+		return err
+	}
+
+	// Deduplicate: if the ADIF has duplicate QSOs (same to_id, date, time,
+	// from_id), keep only the last occurrence. Postgres doesn't allow ON
+	// CONFLICT DO UPDATE to hit the same row twice in one statement.
+	_, err = tx.Exec(ctx, `DELETE FROM _tmp_contacts a USING _tmp_contacts b
+		WHERE a.to_id = b.to_id AND a.date = b.date AND a.time = b.time AND a.from_id = b.from_id
+		AND a._ord < b._ord`)
 	if err != nil {
 		return err
 	}
@@ -444,6 +465,13 @@ func bulkInsertMatches(ctx context.Context, pool *pgxpool.Pool, matches []matchR
 
 func nilIfEmpty(s string) any {
 	if s == "" {
+		return nil
+	}
+	return s
+}
+
+func nilIfEmptySlice(s []string) any {
+	if len(s) == 0 {
 		return nil
 	}
 	return s
