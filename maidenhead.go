@@ -6,8 +6,9 @@ import (
 )
 
 // Maidenhead grid locators are encoded as a single integer using mixed-radix
-// positional notation, stored in the contacts.grid column. The contacts.grid_size
-// column stores the original precision (4, 6, 8, 10, or 12 characters).
+// positional notation, stored in the matcher_contact.grid column. The
+// matcher_contact.grid_size column stores the original precision (4, 6, 8, 10,
+// or 12 characters).
 //
 // The Maidenhead system uses alternating letter/digit pairs:
 //

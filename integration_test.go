@@ -122,9 +122,9 @@ func parseAndInsertWithDB(
 	}
 
 	var count int
-	pool.QueryRow(ctx, "SELECT count(*) FROM contacts").Scan(&count)
+	pool.QueryRow(ctx, "SELECT count(*) FROM matcher_contact").Scan(&count)
 	if count != len(contacts) {
-		t.Errorf("expected %d rows in contacts, got %d", len(contacts), count)
+		t.Errorf("expected %d rows in matcher_contact, got %d", len(contacts), count)
 	}
 
 	for i, c := range contacts {
@@ -207,5 +207,94 @@ func TestReaderForExtension(t *testing.T) {
 				t.Errorf("for %q: got reader type %q, want %q", tt.filename, got, tt.wantType)
 			}
 		})
+	}
+}
+
+// writeADIF writes a minimal ADIF file into dir and returns its path.
+func writeADIF(t *testing.T, dir, name string, records ...string) string {
+	t.Helper()
+	path := filepath.Join(dir, name)
+	content := "generated for test\n<EOH>\n" + strings.Join(records, "\n") + "\n"
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func countRow(t *testing.T, ctx context.Context, pool *pgxpool.Pool, query string) int {
+	t.Helper()
+	var n int
+	if err := pool.QueryRow(ctx, query).Scan(&n); err != nil {
+		t.Fatalf("count query: %v", err)
+	}
+	return n
+}
+
+func TestProcessReplacesCorrectedCallsign(t *testing.T) {
+	initModeMaps()
+	ctx, pool := setupTestDB(t)
+	dir := t.TempDir()
+
+	// K3LR logs a QSO with W1AW.
+	bFile := writeADIF(t, dir, "k3lr.adi",
+		"<CALL:4>W1AW<QSO_DATE:8>20240601<TIME_ON:4>0600<BAND:3>20m<MODE:3>FT8<EOR>")
+	process(ctx, pool, nil, bFile, "K3LR", "")
+
+	// W1AW logs the same QSO but with the wrong callsign, so nothing matches.
+	wrongFile := writeADIF(t, dir, "w1aw-wrong.adi",
+		"<CALL:4>K3LX<QSO_DATE:8>20240601<TIME_ON:4>0601<BAND:3>20m<MODE:3>FT8<EOR>")
+	process(ctx, pool, nil, wrongFile, "W1AW", "")
+
+	if n := countRow(t, ctx, pool, "SELECT count(*) FROM matcher_match"); n != 0 {
+		t.Fatalf("expected no matches with the wrong callsign, got %d", n)
+	}
+
+	// Corrected re-upload anchored to the wrong file: the K3LX contact is
+	// stale (present in old, absent in new) and must be deleted; the
+	// corrected contact matches K3LR's log.
+	fixedFile := writeADIF(t, dir, "w1aw-fixed.adi",
+		"<CALL:4>K3LR<QSO_DATE:8>20240601<TIME_ON:4>0601<BAND:3>20m<MODE:3>FT8<EOR>")
+	process(ctx, pool, nil, fixedFile, "W1AW", wrongFile)
+
+	if n := countRow(t, ctx, pool, "SELECT count(*) FROM matcher_match"); n != 1 {
+		t.Fatalf("expected 1 match after correction, got %d", n)
+	}
+	if n := countRow(t, ctx, pool, `SELECT count(*) FROM matcher_contact c
+		JOIN matcher_callsign k ON k.id = c.to_id WHERE k.callsign = 'K3LX'`); n != 0 {
+		t.Fatalf("expected the wrong-callsign contact to be deleted, got %d", n)
+	}
+	if n := countRow(t, ctx, pool, `SELECT count(*) FROM matcher_contact c
+		JOIN matcher_callsign k ON k.id = c.from_id WHERE k.callsign = 'W1AW'`); n != 1 {
+		t.Fatalf("expected exactly 1 contact from W1AW, got %d", n)
+	}
+}
+
+func TestProcessRevalidatesChangedBand(t *testing.T) {
+	initModeMaps()
+	ctx, pool := setupTestDB(t)
+	dir := t.TempDir()
+
+	bFile := writeADIF(t, dir, "k3lr.adi",
+		"<CALL:4>W1AW<QSO_DATE:8>20240601<TIME_ON:4>0600<BAND:3>20m<MODE:3>FT8<EOR>")
+	process(ctx, pool, nil, bFile, "K3LR", "")
+
+	aFile := writeADIF(t, dir, "w1aw.adi",
+		"<CALL:4>K3LR<QSO_DATE:8>20240601<TIME_ON:4>0601<BAND:3>20m<MODE:3>FT8<EOR>")
+	process(ctx, pool, nil, aFile, "W1AW", "")
+
+	if n := countRow(t, ctx, pool, "SELECT count(*) FROM matcher_match"); n != 1 {
+		t.Fatalf("expected 1 match, got %d", n)
+	}
+
+	// Same identity key (call, date, time) but the band was corrected: the
+	// upsert updates the row in place and the existing match no longer
+	// satisfies the rules, so revalidation must delete it. A plain re-upload
+	// suffices; no replaces anchor is needed for field corrections.
+	aFixed := writeADIF(t, dir, "w1aw-fixed.adi",
+		"<CALL:4>K3LR<QSO_DATE:8>20240601<TIME_ON:4>0601<BAND:3>40m<MODE:3>FT8<EOR>")
+	process(ctx, pool, nil, aFixed, "W1AW", "")
+
+	if n := countRow(t, ctx, pool, "SELECT count(*) FROM matcher_match"); n != 0 {
+		t.Fatalf("expected the stale match to be deleted after band correction, got %d", n)
 	}
 }

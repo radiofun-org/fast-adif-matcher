@@ -63,7 +63,7 @@ func setupTestDB(t *testing.T) (context.Context, *pgxpool.Pool) {
 	ctx := context.Background()
 
 	// Truncate all tables to give each test a clean slate
-	for _, table := range []string{"matches", "contacts", "adif_metadata", "callsigns"} {
+	for _, table := range []string{"matcher_match", "matcher_contact", "matcher_adif_metadata", "matcher_callsign"} {
 		if _, err := testPool.Exec(ctx, fmt.Sprintf("TRUNCATE %s CASCADE", table)); err != nil {
 			t.Fatalf("truncate %s: %v", table, err)
 		}
@@ -120,13 +120,20 @@ func TestInsertAdifMetadata(t *testing.T) {
 		t.Fatalf("expected id > 0, got %d", id)
 	}
 
-	// duplicate hash returns 0
+	// duplicate hash returns the existing id
 	id2, err := insertAdifMetadata(ctx, pool, 2000, "abc123", "3.1.4", "test", "1.0")
 	if err != nil {
 		t.Fatalf("insertAdifMetadata duplicate: %v", err)
 	}
-	if id2 != 0 {
-		t.Fatalf("expected 0 for duplicate hash, got %d", id2)
+	if id2 != id {
+		t.Fatalf("expected existing id %d for duplicate hash, got %d", id, id2)
+	}
+
+	var processTime int64
+	pool.QueryRow(ctx, "SELECT process_time FROM matcher_adif_metadata WHERE id = $1", id).
+		Scan(&processTime)
+	if processTime != 2000 {
+		t.Fatalf("expected process_time updated to 2000, got %d", processTime)
 	}
 
 	// different hash returns new id
@@ -231,7 +238,8 @@ func TestBulkInsertContacts(t *testing.T) {
 
 	// verify the band was updated
 	var band int
-	err = pool.QueryRow(ctx, "SELECT band FROM contacts WHERE id = $1", contacts[0].ID).Scan(&band)
+	err = pool.QueryRow(ctx, "SELECT band FROM matcher_contact WHERE id = $1", contacts[0].ID).
+		Scan(&band)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -265,7 +273,7 @@ func TestBulkInsertContactsSigCoalesce(t *testing.T) {
 	// Verify POTA and sig fields are stored
 	var pota []string
 	var iota_, sig, sigInfo *string
-	err = pool.QueryRow(ctx, "SELECT my_pota, my_iota, my_sig, my_sig_info FROM contacts WHERE id = $1", id).
+	err = pool.QueryRow(ctx, "SELECT my_pota, my_iota, my_sig, my_sig_info FROM matcher_contact WHERE id = $1", id).
 		Scan(&pota, &iota_, &sig, &sigInfo)
 	if err != nil {
 		t.Fatal(err)
@@ -302,7 +310,7 @@ func TestBulkInsertContactsSigCoalesce(t *testing.T) {
 	}
 
 	// Both POTA and IOTA should be present; sig fields updated to IOTA
-	err = pool.QueryRow(ctx, "SELECT my_pota, my_iota, my_sig, my_sig_info FROM contacts WHERE id = $1", id).
+	err = pool.QueryRow(ctx, "SELECT my_pota, my_iota, my_sig, my_sig_info FROM matcher_contact WHERE id = $1", id).
 		Scan(&pota, &iota_, &sig, &sigInfo)
 	if err != nil {
 		t.Fatal(err)
@@ -333,7 +341,7 @@ func TestBulkInsertContactsSigCoalesce(t *testing.T) {
 		t.Fatalf("insert upload 3: %v", err)
 	}
 
-	err = pool.QueryRow(ctx, "SELECT my_pota, my_iota FROM contacts WHERE id = $1", id).
+	err = pool.QueryRow(ctx, "SELECT my_pota, my_iota FROM matcher_contact WHERE id = $1", id).
 		Scan(&pota, &iota_)
 	if err != nil {
 		t.Fatal(err)
@@ -371,7 +379,7 @@ func TestBulkInsertContactsCustomSig(t *testing.T) {
 	var potaArr []string
 	err = pool.QueryRow(
 		ctx,
-		"SELECT my_sig, my_sig_info, my_pota, my_sota, my_wwff, my_iota FROM contacts WHERE id = $1",
+		"SELECT my_sig, my_sig_info, my_pota, my_sota, my_wwff, my_iota FROM matcher_contact WHERE id = $1",
 		id,
 	).Scan(&sig, &sigInfo, &potaArr, &sota, &wwff, &iota_)
 	if err != nil {
@@ -410,7 +418,7 @@ func TestBulkInsertContactsCustomSig(t *testing.T) {
 	}
 
 	err = pool.QueryRow(ctx,
-		"SELECT my_sig, my_sig_info, my_pota FROM contacts WHERE id = $1", id,
+		"SELECT my_sig, my_sig_info, my_pota FROM matcher_contact WHERE id = $1", id,
 	).Scan(&sig, &sigInfo, &potaArr)
 	if err != nil {
 		t.Fatal(err)
@@ -491,7 +499,7 @@ func TestBulkInsertMatches(t *testing.T) {
 	}
 
 	var count int
-	pool.QueryRow(ctx, "SELECT count(*) FROM matches").Scan(&count)
+	pool.QueryRow(ctx, "SELECT count(*) FROM matcher_match").Scan(&count)
 	if count != 1 {
 		t.Fatalf("expected 1 match row, got %d", count)
 	}
@@ -501,9 +509,73 @@ func TestBulkInsertMatches(t *testing.T) {
 	if err != nil {
 		t.Fatalf("bulkInsertMatches duplicate: %v", err)
 	}
-	pool.QueryRow(ctx, "SELECT count(*) FROM matches").Scan(&count)
+	pool.QueryRow(ctx, "SELECT count(*) FROM matcher_match").Scan(&count)
 	if count != 1 {
 		t.Fatalf("expected still 1 match row after duplicate, got %d", count)
+	}
+}
+
+func TestBulkInsertMatchesReversedDuplicate(t *testing.T) {
+	ctx, pool := setupTestDB(t)
+
+	metaId, _ := insertAdifMetadata(ctx, pool, 1000, "hash1", "3.1.4", "test", "1.0")
+	call1, _ := addCallsign(ctx, pool, "W1AW")
+	call2, _ := addCallsign(ctx, pool, "K3LR")
+
+	contacts := []Contact{
+		{Date: 27000, Time: 600, FromID: call1, ToID: call2, Band: 8, Mode: 29},
+		{Date: 27000, Time: 601, FromID: call2, ToID: call1, Band: 8, Mode: 29},
+	}
+	bulkInsertContacts(ctx, pool, contacts, metaId)
+
+	// The same QSO discovered from both directions: first when one side
+	// uploads, then again with the roles swapped when the other side
+	// re-uploads. Only one match row may result.
+	err := bulkInsertMatches(ctx, pool, []matchRecord{
+		{
+			MatchedAt: 9999,
+			AID:       contacts[0].ID,
+			BID:       contacts[1].ID,
+			ACallID:   call1,
+			BCallID:   call2,
+		},
+	})
+	if err != nil {
+		t.Fatalf("bulkInsertMatches: %v", err)
+	}
+	err = bulkInsertMatches(ctx, pool, []matchRecord{
+		{
+			MatchedAt: 10000,
+			AID:       contacts[1].ID,
+			BID:       contacts[0].ID,
+			ACallID:   call2,
+			BCallID:   call1,
+		},
+	})
+	if err != nil {
+		t.Fatalf("bulkInsertMatches reversed: %v", err)
+	}
+
+	var count int
+	pool.QueryRow(ctx, "SELECT count(*) FROM matcher_match").Scan(&count)
+	if count != 1 {
+		t.Fatalf("expected 1 match row after reversed duplicate, got %d", count)
+	}
+
+	// The stored row must pair each contact ID with that contact's callsign.
+	var aId, bId, aCallId, bCallId int64
+	pool.QueryRow(ctx,
+		"SELECT a_id, b_id, a_call_id, b_call_id FROM matcher_match").
+		Scan(&aId, &bId, &aCallId, &bCallId)
+	if aId >= bId {
+		t.Fatalf("expected canonical order a_id < b_id, got a_id=%d b_id=%d", aId, bId)
+	}
+	if aCallId != call1 || bCallId != call2 {
+		t.Fatalf(
+			"call IDs not paired with their contacts: a_call_id=%d b_call_id=%d",
+			aCallId,
+			bCallId,
+		)
 	}
 }
 
@@ -527,12 +599,65 @@ func TestBulkInsertContacts_MultiParkPOTA(t *testing.T) {
 	}
 
 	var pota []string
-	err = pool.QueryRow(ctx, "SELECT my_pota FROM contacts WHERE id = $1", contacts[0].ID).
+	err = pool.QueryRow(ctx, "SELECT my_pota FROM matcher_contact WHERE id = $1", contacts[0].ID).
 		Scan(&pota)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(pota) != 2 || pota[0] != "K-0059" || pota[1] != "K-1234" {
 		t.Fatalf("expected {K-0059,K-1234}, got %v", pota)
+	}
+}
+
+func TestDeleteContactsByKeysAndMatches(t *testing.T) {
+	ctx, pool := setupTestDB(t)
+
+	metaId, _ := insertAdifMetadata(ctx, pool, 1000, "hash1", "3.1.4", "test", "1.0")
+	call1, _ := addCallsign(ctx, pool, "W1AW")
+	call2, _ := addCallsign(ctx, pool, "K3LR")
+
+	contacts := []Contact{
+		{Date: 27000, Time: 600, FromID: call1, ToID: call2, Band: 8, Mode: 29},
+		{Date: 27000, Time: 601, FromID: call2, ToID: call1, Band: 8, Mode: 29},
+		{Date: 27000, Time: 700, FromID: call1, ToID: call2, Band: 8, Mode: 29},
+	}
+	bulkInsertContacts(ctx, pool, contacts, metaId)
+	bulkInsertMatches(ctx, pool, []matchRecord{
+		{
+			MatchedAt: 9999,
+			AID:       contacts[0].ID,
+			BID:       contacts[1].ID,
+			ACallID:   call1,
+			BCallID:   call2,
+		},
+	})
+
+	deleted, err := deleteContactsByKeys(ctx, pool, call1,
+		[]contactKey{{ToID: call2, Date: 27000, Time: 600}})
+	if err != nil {
+		t.Fatalf("deleteContactsByKeys: %v", err)
+	}
+	if len(deleted) != 1 || deleted[0] != contacts[0].ID {
+		t.Fatalf("expected deleted IDs [%d], got %v", contacts[0].ID, deleted)
+	}
+
+	affected, err := deleteMatchesReferencing(ctx, pool, deleted)
+	if err != nil {
+		t.Fatalf("deleteMatchesReferencing: %v", err)
+	}
+	affectedSet := map[int64]bool{}
+	for _, id := range affected {
+		affectedSet[id] = true
+	}
+	if !affectedSet[call1] || !affectedSet[call2] {
+		t.Fatalf("expected both call IDs in affected set, got %v", affected)
+	}
+
+	if n := countRow(t, ctx, pool, "SELECT count(*) FROM matcher_match"); n != 0 {
+		t.Fatalf("expected match deleted, got %d", n)
+	}
+	// The other contacts survive.
+	if n := countRow(t, ctx, pool, "SELECT count(*) FROM matcher_contact"); n != 2 {
+		t.Fatalf("expected 2 remaining contacts, got %d", n)
 	}
 }

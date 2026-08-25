@@ -22,6 +22,45 @@ func callsMap() map[string]int64 {
 	return map[string]int64{"W1AW": 1, "K3LR": 2}
 }
 
+func TestContactsMatchUnknownBand(t *testing.T) {
+	initModeMaps()
+
+	ft8 := Modes["FT8"]
+	a := Contact{Date: 27000, Time: 600, Band: 0, Mode: ft8}
+	b := Contact{Date: 27000, Time: 605, Band: 0, Mode: ft8}
+
+	// Band 0 means the band was missing and couldn't be inferred; two
+	// unknowns are not evidence of the same band.
+	if contactsMatch(a, b) {
+		t.Error("two unknown-band contacts must not match")
+	}
+
+	a.Band, b.Band = 8, 8
+	if !contactsMatch(a, b) {
+		t.Error("same known band, time, and mode should match")
+	}
+
+	b.Band = 9
+	if contactsMatch(a, b) {
+		t.Error("different bands must not match")
+	}
+}
+
+func TestNormalizeCallsign(t *testing.T) {
+	cases := map[string]string{
+		"W1AW":      "W1AW",
+		"w1aw":      "W1AW",
+		" w1aw ":    "W1AW",
+		"k3lr/p":    "K3LR/P",
+		"\tVE3XYZ ": "VE3XYZ",
+	}
+	for input, want := range cases {
+		if got := normalizeCallsign(input); got != want {
+			t.Errorf("normalizeCallsign(%q) = %q, want %q", input, got, want)
+		}
+	}
+}
+
 func TestWithinThirtyMinutes(t *testing.T) {
 	var tests = []struct {
 		name   string

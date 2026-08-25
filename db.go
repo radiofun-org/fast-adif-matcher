@@ -11,6 +11,13 @@ type matchRecord struct {
 	MatchedAt, AID, BID, ACallID, BCallID int64
 }
 
+// contactKey is a contact's identity within one station's log: who was
+// worked, and when. from_id is implicit (the uploading station).
+type contactKey struct {
+	ToID       int64
+	Date, Time int
+}
+
 func openPool(ctx context.Context, connString string) (*pgxpool.Pool, error) {
 	cfg, err := pgxpool.ParseConfig(connString)
 	if err != nil {
@@ -20,9 +27,15 @@ func openPool(ctx context.Context, connString string) (*pgxpool.Pool, error) {
 	return pgxpool.NewWithConfig(ctx, cfg)
 }
 
+// initDatabase creates the matcher tables if they don't exist. The website's
+// Django migrations (contacts/migrations/) are the authoritative schema — they
+// also add read-path indexes the matcher doesn't need. This DDL exists so the
+// matcher runs standalone against a fresh Postgres (the perf loop, test.sh,
+// testcontainers) without needing Django; keep it in sync with the Django
+// models when either changes.
 func initDatabase(ctx context.Context, pool *pgxpool.Pool) error {
 	_, err := pool.Exec(ctx, `
-		CREATE TABLE IF NOT EXISTS contacts (
+		CREATE TABLE IF NOT EXISTS matcher_contact (
 			id BIGSERIAL PRIMARY KEY,
 			adif_metadata_id BIGINT,
 			date SMALLINT,
@@ -56,7 +69,7 @@ func initDatabase(ctx context.Context, pool *pgxpool.Pool) error {
 	// Migrate my_pota from TEXT to TEXT[] for existing databases
 	_, err = pool.Exec(ctx, `
 		DO $$ BEGIN
-			ALTER TABLE contacts ALTER COLUMN my_pota TYPE TEXT[]
+			ALTER TABLE matcher_contact ALTER COLUMN my_pota TYPE TEXT[]
 				USING CASE WHEN my_pota IS NOT NULL THEN string_to_array(my_pota, ',') ELSE NULL END;
 		EXCEPTION WHEN others THEN NULL;
 		END $$`)
@@ -65,7 +78,7 @@ func initDatabase(ctx context.Context, pool *pgxpool.Pool) error {
 	}
 
 	_, err = pool.Exec(ctx, `
-		CREATE TABLE IF NOT EXISTS adif_metadata (
+		CREATE TABLE IF NOT EXISTS matcher_adif_metadata (
 			id BIGSERIAL PRIMARY KEY,
 			process_time BIGINT,
 			file_hash TEXT UNIQUE,
@@ -78,7 +91,7 @@ func initDatabase(ctx context.Context, pool *pgxpool.Pool) error {
 	}
 
 	_, err = pool.Exec(ctx, `
-		CREATE TABLE IF NOT EXISTS matches (
+		CREATE TABLE IF NOT EXISTS matcher_match (
 			id BIGSERIAL PRIMARY KEY,
 			matched_at BIGINT,
 			a_id BIGINT,
@@ -92,7 +105,7 @@ func initDatabase(ctx context.Context, pool *pgxpool.Pool) error {
 	}
 
 	_, err = pool.Exec(ctx, `
-		CREATE TABLE IF NOT EXISTS callsigns (
+		CREATE TABLE IF NOT EXISTS matcher_callsign (
 			id BIGSERIAL PRIMARY KEY,
 			callsign TEXT UNIQUE
 		)`)
@@ -106,8 +119,8 @@ func initDatabase(ctx context.Context, pool *pgxpool.Pool) error {
 func addCallsign(ctx context.Context, pool *pgxpool.Pool, callsign string) (int64, error) {
 	var id int64
 	err := pool.QueryRow(ctx,
-		`INSERT INTO callsigns (callsign) VALUES ($1)
-		 ON CONFLICT(callsign) DO UPDATE SET callsign=callsigns.callsign
+		`INSERT INTO matcher_callsign (callsign) VALUES ($1)
+		 ON CONFLICT(callsign) DO UPDATE SET callsign=matcher_callsign.callsign
 		 RETURNING id`,
 		callsign,
 	).Scan(&id)
@@ -123,9 +136,9 @@ func insertAdifMetadata(
 	var id int64
 	err := pool.QueryRow(
 		ctx,
-		`INSERT INTO adif_metadata (process_time, file_hash, adif_version, program_id, program_version)
+		`INSERT INTO matcher_adif_metadata (process_time, file_hash, adif_version, program_id, program_version)
 		 VALUES ($1, $2, $3, $4, $5)
-		 ON CONFLICT (file_hash) DO NOTHING
+		 ON CONFLICT (file_hash) DO UPDATE SET process_time = excluded.process_time
 		 RETURNING id`,
 		processTime,
 		fileHash,
@@ -133,9 +146,6 @@ func insertAdifMetadata(
 		programId,
 		programVersion,
 	).Scan(&id)
-	if err == pgx.ErrNoRows {
-		return 0, nil
-	}
 	return id, err
 }
 
@@ -146,7 +156,7 @@ func queryCallsigns(
 ) (map[string]int64, error) {
 	result := map[string]int64{}
 	rows, err := pool.Query(ctx,
-		`SELECT id, callsign FROM callsigns WHERE callsign = ANY($1)`,
+		`SELECT id, callsign FROM matcher_callsign WHERE callsign = ANY($1)`,
 		callsigns,
 	)
 	if err != nil {
@@ -207,9 +217,9 @@ func bulkInsertCallsigns(
 	}
 
 	rows, err := tx.Query(ctx,
-		`INSERT INTO callsigns (callsign)
+		`INSERT INTO matcher_callsign (callsign)
 		 SELECT callsign FROM _tmp_callsigns
-		 ON CONFLICT(callsign) DO UPDATE SET callsign=callsigns.callsign
+		 ON CONFLICT(callsign) DO UPDATE SET callsign=matcher_callsign.callsign
 		 RETURNING id, callsign`,
 	)
 	if err != nil {
@@ -320,7 +330,7 @@ func bulkInsertContacts(
 
 	rows, err := tx.Query(ctx,
 		`WITH ins AS (
-			INSERT INTO contacts (
+			INSERT INTO matcher_contact (
 				adif_metadata_id, date, time, time_off,
 				from_id, to_id, band, mode, sub_mode,
 				grid, grid_size,
@@ -351,13 +361,13 @@ func bulkInsertContacts(
 				zone_cq=excluded.zone_cq,
 				zone_itu=excluded.zone_itu,
 				tx_power=excluded.tx_power,
-				my_pota=COALESCE(excluded.my_pota,contacts.my_pota),
-				my_sota=COALESCE(excluded.my_sota,contacts.my_sota),
-				my_wwff=COALESCE(excluded.my_wwff,contacts.my_wwff),
-				my_iota=COALESCE(excluded.my_iota,contacts.my_iota),
-				my_sig=COALESCE(excluded.my_sig,contacts.my_sig),
-				my_sig_info=COALESCE(excluded.my_sig_info,contacts.my_sig_info)
-			RETURNING contacts.id, contacts.to_id, contacts.date, contacts.time, contacts.from_id
+				my_pota=COALESCE(excluded.my_pota,matcher_contact.my_pota),
+				my_sota=COALESCE(excluded.my_sota,matcher_contact.my_sota),
+				my_wwff=COALESCE(excluded.my_wwff,matcher_contact.my_wwff),
+				my_iota=COALESCE(excluded.my_iota,matcher_contact.my_iota),
+				my_sig=COALESCE(excluded.my_sig,matcher_contact.my_sig),
+				my_sig_info=COALESCE(excluded.my_sig_info,matcher_contact.my_sig_info)
+			RETURNING matcher_contact.id, matcher_contact.to_id, matcher_contact.date, matcher_contact.time, matcher_contact.from_id
 		)
 		SELECT ins.id, t._ord FROM ins
 		JOIN _tmp_contacts t ON t.to_id = ins.to_id AND t.date = ins.date AND t.time = ins.time AND t.from_id = ins.from_id
@@ -398,7 +408,7 @@ func findPotentialMatches(
 
 	rows, err := pool.Query(ctx,
 		`SELECT id, date, time, time_off, from_id, to_id, band, mode, grid, grid_size
-		 FROM contacts
+		 FROM matcher_contact
 		 WHERE to_id = $1 AND date >= $2 AND date <= $3`,
 		fromId, dateStart, dateEnd,
 	)
@@ -424,6 +434,18 @@ func findPotentialMatches(
 func bulkInsertMatches(ctx context.Context, pool *pgxpool.Pool, matches []matchRecord) error {
 	if len(matches) == 0 {
 		return nil
+	}
+
+	// Canonicalize so a_id < b_id. The same QSO is discovered from both
+	// directions (once per side's upload); without a canonical order the
+	// UNIQUE (a_id, b_id) constraint can't stop the reversed duplicate.
+	// Call IDs swap together with their contact IDs to keep them paired.
+	for i := range matches {
+		m := &matches[i]
+		if m.AID > m.BID {
+			m.AID, m.BID = m.BID, m.AID
+			m.ACallID, m.BCallID = m.BCallID, m.ACallID
+		}
 	}
 
 	tx, err := pool.Begin(ctx)
@@ -453,7 +475,7 @@ func bulkInsertMatches(ctx context.Context, pool *pgxpool.Pool, matches []matchR
 	}
 
 	_, err = tx.Exec(ctx,
-		`INSERT INTO matches (matched_at, a_id, b_id, a_call_id, b_call_id)
+		`INSERT INTO matcher_match (matched_at, a_id, b_id, a_call_id, b_call_id)
 		 SELECT matched_at, a_id, b_id, a_call_id, b_call_id FROM _tmp_matches
 		 ON CONFLICT (a_id, b_id) DO NOTHING`)
 	if err != nil {
@@ -461,6 +483,207 @@ func bulkInsertMatches(ctx context.Context, pool *pgxpool.Pool, matches []matchR
 	}
 
 	return tx.Commit(ctx)
+}
+
+// deleteContactsByKeys deletes fromId's contacts matching the identity keys
+// and returns the deleted contact IDs.
+func deleteContactsByKeys(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	fromId int64,
+	keys []contactKey,
+) ([]int64, error) {
+	if len(keys) == 0 {
+		return nil, nil
+	}
+
+	toIDs := make([]int64, len(keys))
+	dates := make([]int16, len(keys))
+	times := make([]int16, len(keys))
+	for i, k := range keys {
+		toIDs[i] = k.ToID
+		dates[i] = int16(k.Date)
+		times[i] = int16(k.Time)
+	}
+
+	rows, err := pool.Query(ctx,
+		`DELETE FROM matcher_contact c
+		 USING unnest($2::bigint[], $3::smallint[], $4::smallint[]) AS s(to_id, date, "time")
+		 WHERE c.from_id = $1 AND c.to_id = s.to_id AND c.date = s.date AND c.time = s."time"
+		 RETURNING c.id`,
+		fromId, toIDs, dates, times,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var deleted []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		deleted = append(deleted, id)
+	}
+	return deleted, rows.Err()
+}
+
+// deleteMatchesReferencing deletes matches that point at any of the given
+// contact IDs and returns the callsign IDs on either side of the deleted
+// matches, whose award progress needs re-evaluation.
+func deleteMatchesReferencing(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	contactIDs []int64,
+) ([]int64, error) {
+	if len(contactIDs) == 0 {
+		return nil, nil
+	}
+
+	rows, err := pool.Query(ctx,
+		`DELETE FROM matcher_match
+		 WHERE a_id = ANY($1) OR b_id = ANY($1)
+		 RETURNING a_call_id, b_call_id`,
+		contactIDs,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	affected := map[int64]bool{}
+	for rows.Next() {
+		var a, b int64
+		if err := rows.Scan(&a, &b); err != nil {
+			return nil, err
+		}
+		affected[a] = true
+		affected[b] = true
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	ids := make([]int64, 0, len(affected))
+	for id := range affected {
+		ids = append(ids, id)
+	}
+	return ids, nil
+}
+
+// fetchContactsByID returns the fields needed to re-run the match rules.
+func fetchContactsByID(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	ids []int64,
+) (map[int64]Contact, error) {
+	result := map[int64]Contact{}
+	rows, err := pool.Query(ctx,
+		`SELECT id, date, time, time_off, from_id, to_id, band, mode
+		 FROM matcher_contact WHERE id = ANY($1)`,
+		ids,
+	)
+	if err != nil {
+		return result, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var c Contact
+		if err := rows.Scan(
+			&c.ID, &c.Date, &c.Time, &c.TimeOff,
+			&c.FromID, &c.ToID, &c.Band, &c.Mode,
+		); err != nil {
+			return result, err
+		}
+		result[c.ID] = c
+	}
+	return result, rows.Err()
+}
+
+// revalidateMatches re-checks existing matches that reference the given
+// contacts. An upsert can change a contact's band, mode, or end time, and a
+// match made under the old values may no longer hold; those matches are
+// deleted. Returns the callsign IDs on either side of deleted matches.
+func revalidateMatches(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	contactIDs []int64,
+) ([]int64, error) {
+	if len(contactIDs) == 0 {
+		return nil, nil
+	}
+
+	type matchRow struct {
+		id, aID, bID, aCallID, bCallID int64
+	}
+
+	rows, err := pool.Query(ctx,
+		`SELECT id, a_id, b_id, a_call_id, b_call_id
+		 FROM matcher_match WHERE a_id = ANY($1) OR b_id = ANY($1)`,
+		contactIDs,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	var candidates []matchRow
+	referenced := map[int64]bool{}
+	for rows.Next() {
+		var m matchRow
+		if err := rows.Scan(&m.id, &m.aID, &m.bID, &m.aCallID, &m.bCallID); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		candidates = append(candidates, m)
+		referenced[m.aID] = true
+		referenced[m.bID] = true
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(candidates) == 0 {
+		return nil, nil
+	}
+
+	refIDs := make([]int64, 0, len(referenced))
+	for id := range referenced {
+		refIDs = append(refIDs, id)
+	}
+	contacts, err := fetchContactsByID(ctx, pool, refIDs)
+	if err != nil {
+		return nil, err
+	}
+
+	var staleIDs []int64
+	affected := map[int64]bool{}
+	for _, m := range candidates {
+		a, okA := contacts[m.aID]
+		b, okB := contacts[m.bID]
+		if okA && okB && contactsMatch(a, b) {
+			continue
+		}
+		staleIDs = append(staleIDs, m.id)
+		affected[m.aCallID] = true
+		affected[m.bCallID] = true
+	}
+	if len(staleIDs) == 0 {
+		return nil, nil
+	}
+
+	if _, err := pool.Exec(ctx,
+		`DELETE FROM matcher_match WHERE id = ANY($1)`, staleIDs,
+	); err != nil {
+		return nil, err
+	}
+
+	ids := make([]int64, 0, len(affected))
+	for id := range affected {
+		ids = append(ids, id)
+	}
+	return ids, nil
 }
 
 func nilIfEmpty(s string) any {

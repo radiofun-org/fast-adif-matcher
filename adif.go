@@ -648,7 +648,7 @@ func recordToContact(
 	if !ok {
 		return contact, fmt.Errorf("missing CALL in record %s", record)
 	}
-	contact.ToID = callsInDB[call.Value]
+	contact.ToID = callsInDB[normalizeCallsign(call.Value)]
 	if contact.ToID == 0 {
 		return contact, fmt.Errorf("unknown callsign %q", call.Value)
 	}
