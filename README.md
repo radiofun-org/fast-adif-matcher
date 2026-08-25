@@ -38,4 +38,4 @@ docker compose up -d # Postgres on :5433 for the shell scripts
 ./test.sh            # build, import sample logs from tmp/, print matches
 ```
 
-`adif-spec/` holds the ADIF 3.1.6 specification the field handling is based on.
+`adif-spec/` holds the ADIF 3.1.7 specification the field handling is based on.

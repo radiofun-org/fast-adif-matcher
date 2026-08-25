@@ -150,6 +150,7 @@ var Modes = map[string]int{
 	"WSPR":         101,
 	"FSK":          102,
 	"MTONE":        103,
+	"OFDM":         104,
 }
 
 var SubModes = map[string]int{
@@ -336,6 +337,10 @@ var SubModes = map[string]int{
 	"SCAMP_VSLOW":    181,
 	"SCAMP_OO":       182,
 	"SCAMP_OO_SLW":   183,
+	"FREEDATA":       184,
+	"FT2":            185,
+	"RIBBIT_PIX":     186,
+	"RIBBIT_SMS":     187,
 }
 
 var ModeGroups = map[string]string{
@@ -413,6 +418,7 @@ var ModeGroups = map[string]string{
 	"WSPR":         "DATA",
 	"FSK":          "DATA",
 	"MTONE":        "DATA",
+	"OFDM":         "DATA",
 }
 
 // ModeGroupsById is populated at startup from ModeGroups + Modes.

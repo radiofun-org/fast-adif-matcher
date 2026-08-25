@@ -576,3 +576,29 @@ func TestSplitPotaRefs(t *testing.T) {
 		})
 	}
 }
+
+// Every mode and submode the ADIF spec defines must have a local integer ID,
+// and every current (non-import-only) mode a mode group, so a spec upgrade
+// that adds enumerations fails here instead of silently storing those
+// contacts with an unknown mode.
+func TestSpecModesHaveLocalIds(t *testing.T) {
+	for _, v := range spec.ModeEnumeration.Values {
+		m := v.(spec.ModeEnum)
+		mode := strings.ToUpper(m.Mode)
+		if _, ok := Modes[mode]; !ok {
+			t.Errorf("Modes is missing spec mode %q", mode)
+		}
+		if m.ImportOnly != "" {
+			continue
+		}
+		if _, ok := ModeGroups[mode]; !ok {
+			t.Errorf("ModeGroups is missing spec mode %q", mode)
+		}
+	}
+	for _, v := range spec.SubmodeEnumeration.Values {
+		sub := strings.ToUpper(v.(spec.SubmodeEnum).Submode)
+		if _, ok := SubModes[sub]; !ok {
+			t.Errorf("SubModes is missing spec submode %q", sub)
+		}
+	}
+}

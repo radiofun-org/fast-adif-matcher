@@ -14,8 +14,8 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-const testADIFile = "adif-spec/316/tests/ADIF_316_test_QSOs_2025_09_15.adi"
-const testADXFile = "adif-spec/316/tests/ADIF_316_test_QSOs_2025_09_15.adx"
+const testADIFile = "adif-spec/317/tests/ADIF_317_test_QSOs_2026_03_22.adi"
+const testADXFile = "adif-spec/317/tests/ADIF_317_test_QSOs_2026_03_22.adx"
 
 func parseAndInsert(t *testing.T, filename string, reader adif.Reader) int {
 	t.Helper()
@@ -111,7 +111,7 @@ func parseAndInsertWithDB(
 		t.Fatal("converted 0 contacts")
 	}
 
-	metaId, err := insertAdifMetadata(ctx, pool, 1000, "test-hash", "3.1.6", "test", "1.0")
+	metaId, err := insertAdifMetadata(ctx, pool, 1000, "test-hash", "3.1.7", "test", "1.0")
 	if err != nil {
 		t.Fatalf("insertAdifMetadata: %v", err)
 	}
